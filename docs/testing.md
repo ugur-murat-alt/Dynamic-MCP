@@ -38,8 +38,8 @@ validation.
 
 ## Current Suite
 
-The v0.1.1 full suite contains **113 tests** under
-`cargo test --workspace --all-features -- --list`: 93 unit tests and 20
+The v0.1.2 full suite contains **114 tests** under
+`cargo test --workspace --all-features -- --list`: 93 unit tests and 21
 integration or end-to-end tests, with 0 ignored. There are currently no
 doctests.
 
@@ -51,7 +51,7 @@ doctests.
 | CLI, harness, IPC, bridge, and daemon unit | 27 | Detailed help and harness parsing, shell-free harness argv generation, absolute runtime paths, exit codes, length-prefixed IPC framing, endpoint validation, bidirectional bridge byte forwarding and EOF draining, daemon metadata, protocol mismatch, and empty-registry control requests. |
 | Batch unit and end-to-end | 8 | Batch input validation, explicit-connect and shutdown preconditions, `join_all` concurrency and input ordering, item error isolation, result preservation, derived control timeout, and CLI exit precedence. |
 | Real stdio runtime end-to-end | 7 | Downstream process initialization, discovery, calls, timeout reuse, concurrent lifecycle operations, cancellation ordering, crashes, reconnects, and shared shutdown. |
-| Local Streamable HTTP end-to-end | 2 | HTTP initialization, resolved header delivery, secret redaction, paginated discovery, and stale cache preservation after refresh failure. |
+| Local Streamable HTTP end-to-end | 3 | HTTP initialization, resolved header delivery, secret redaction, paginated discovery, stale cache preservation after refresh failure, and an offline HTTPS TLS ClientHello probe. |
 | Daemon and CLI end-to-end | 5 | Persistent CLI state, complete RMCP bridge chain, shared runtime, daemon exclusivity, and active-session shutdown. |
 | Harness CLI end-to-end | 2 | OpenCode and Claude Code argv separation, repeatable Claude scope replacement, JSON output, and missing harness errors without touching real config. |
 
@@ -80,7 +80,9 @@ It verifies:
 servers. It verifies an environment-resolved secret header is delivered to the
 local service but absent from inspection debug output. It also verifies a
 paginated tool listing is collected completely and that a failed refresh leaves
-the prior snapshot available with `stale: true`.
+the prior snapshot available with `stale: true`. A separate local probe verifies
+that an `https://` manifest opens a TLS connection rather than rejecting the
+scheme before network I/O.
 
 `crates/mcp-host-cli/tests/daemon_e2e.rs` runs a real daemon, CLI subprocesses,
 RMCP client -> stdio bridge -> daemon -> downstream fixture chain, one runtime

@@ -6,6 +6,8 @@ defined stdio and Streamable HTTP servers.
 
 The v0.1.1 release adds parallel batch tool invocation while retaining the
 fixed host tool surface and control protocol v1.
+The v0.1.2 release enables native-TLS HTTPS for remote Streamable HTTP MCP
+servers.
 
 The host manages registration, connection lifecycle, tool discovery, caching,
 refresh, invocation, timeout, and shutdown. It does not perform semantic

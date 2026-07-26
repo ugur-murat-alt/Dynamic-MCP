@@ -103,6 +103,10 @@ headers. Header names and values are validated at connection time, and values
 remain secret-safe outside that boundary. HTTP has no OAuth acquisition,
 refresh, browser flow, or other authentication state in V1.
 
+Both `http://` and `https://` endpoints are supported. v0.1.2 enables RMCP's
+native-TLS reqwest client; an offline regression test verifies that an HTTPS
+endpoint opens a TCP connection and begins a TLS ClientHello.
+
 The same RMCP initialization and initial `list_all_tools` sequence applies to
 HTTP. HTTP sessions have no child PID or stderr tail.
 

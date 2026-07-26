@@ -64,7 +64,7 @@ behavior on Windows.
 
 ## Control Protocol
 
-Control protocol version remains `1` in v0.1.1. Each connection carries exactly
+Control protocol version remains `1` in v0.1.2. Each connection carries exactly
 one request and one response, then is closed. The payload is JSON framed as:
 
 ```text
@@ -107,8 +107,8 @@ timeout and the longest explicit or effective item timeout plus five seconds.
 The request and response each remain subject to the 8 MiB frame limit.
 
 Protocol v1 is not a forward-compatible feature negotiation mechanism: a
-v0.1.0 daemon does not recognize `call_tools`. Upgrade the v0.1.1 CLI and daemon
-together.
+v0.1.0 daemon does not recognize `call_tools`. Upgrade both CLI and daemon to
+v0.1.1 or later.
 
 ## MCP Endpoint
 

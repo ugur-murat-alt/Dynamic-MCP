@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use axum::{
@@ -24,7 +25,7 @@ use rmcp::{
 };
 use serde_json::json;
 use tempfile::tempdir;
-use tokio::sync::oneshot;
+use tokio::{io::AsyncReadExt as _, sync::oneshot};
 use tokio_util::sync::CancellationToken;
 
 const SECRET: &str = "http-sentinel-secret";
@@ -211,6 +212,57 @@ async fn paginated_discovery_and_failed_refresh_preserve_the_stale_snapshot() {
         .await
         .expect("HTTP task should join")
         .expect("HTTP server should stop");
+}
+
+#[tokio::test]
+async fn https_transport_opens_a_tls_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("ephemeral TLS probe listener should bind");
+    let address = listener.local_addr().expect("listener should have address");
+    let directory = tempdir().expect("temporary directory should be created");
+    fs::write(
+        directory.path().join("https.toml"),
+        format!(
+            "id = \"https-fixture\"\nname = \"HTTPS Fixture\"\ndescription = \"TLS feature probe\"\n[transport]\ntype = \"http\"\nurl = \"https://{address}/mcp\"\n"
+        ),
+    )
+    .expect("HTTPS manifest should be written");
+    let registry = RegistryBuilder::build(
+        ManifestLoader::new(StaticEnvironment)
+            .load_directory(directory.path())
+            .expect("HTTPS manifest should load"),
+    )
+    .expect("registry should build");
+    let manager = RuntimeManager::new(
+        Arc::new(registry),
+        RuntimeSettings {
+            connect_timeout: Duration::from_secs(2),
+            ..RuntimeSettings::default()
+        },
+    );
+    let connecting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.connect_server("https-fixture").await }
+    });
+
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .expect("HTTPS transport should open a TCP connection")
+        .expect("TLS probe should accept the connection");
+    let mut content_type = [0_u8; 1];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut content_type))
+        .await
+        .expect("TLS ClientHello should arrive")
+        .expect("TLS record byte should be readable");
+    assert_eq!(content_type[0], 0x16, "expected a TLS handshake record");
+    drop(stream);
+
+    let error = connecting
+        .await
+        .expect("connect task should join")
+        .expect_err("plain probe listener cannot finish a TLS handshake");
+    assert_eq!(error.code.as_str(), "HTTP_CONNECTION_FAILED");
 }
 
 #[derive(Clone)]
