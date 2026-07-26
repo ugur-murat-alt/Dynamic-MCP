@@ -1,0 +1,7 @@
+id = "fixture"
+name = "Demo Fixture"
+description = "Offline RMCP fixture server for the Dynamic MCP Host V1 demo"
+
+[transport]
+type = "stdio"
+command = "mcp-host-fixture-server"

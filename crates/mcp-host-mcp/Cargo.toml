@@ -1,0 +1,26 @@
+[package]
+name = "mcp-host-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = "0.8"
+futures-util = "0.3"
+http = "1"
+mcp-host-core = { version = "0.1.0", path = "../mcp-host-core" }
+rmcp = { version = "=2.2.0", features = ["client", "server", "macros", "schemars", "transport-io", "transport-child-process", "transport-async-rw", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "signal", "fs", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3"

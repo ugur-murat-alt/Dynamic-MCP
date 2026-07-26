@@ -1,0 +1,12 @@
+id = "github"
+name = "GitHub"
+description = "Example GitHub MCP server"
+enabled = false
+
+[transport]
+type = "stdio"
+command = "github-mcp-server"
+args = ["stdio"]
+
+[transport.environment]
+GITHUB_TOKEN = "${GITHUB_TOKEN}"

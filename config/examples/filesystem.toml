@@ -1,0 +1,9 @@
+id = "filesystem"
+name = "Filesystem"
+description = "Example filesystem MCP server"
+
+[transport]
+type = "stdio"
+command = "filesystem-mcp-server"
+args = ["--root", "."]
+working_directory = "."
