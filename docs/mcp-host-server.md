@@ -28,13 +28,13 @@ The advertised instructions are:
 2. Call inspect_server to review a server's public configuration and current state.
 3. Call connect_server before using a disconnected server.
 4. Call list_tools after connecting to discover that server's available tools.
-5. Call call_tool with the selected server, tool name, and JSON object arguments.
+5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.
 6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.
 ```
 
 ## Fixed Tool Surface
 
-These are the exact eight inbound tools. No downstream tool is added to this
+These are the exact nine inbound tools. No downstream tool is added to this
 list.
 
 | Tool | Input summary | Output summary |
@@ -45,12 +45,20 @@ list.
 | `disconnect_server` | `{ "server_id": string }` | Structured `DisconnectResult`: server ID, resulting lifecycle state, and disconnect time. It also cancels an in-progress startup when necessary. |
 | `list_tools` | `{ "server_id": string, "refresh": boolean }`; `refresh` defaults to `false`. | Structured `ToolSnapshot`: server ID, fetch time, count, tool definitions, and stale flag. Each tool definition includes input and optional output schemas plus optional metadata. |
 | `call_tool` | `{ "server_id": string, "tool_name": string, "arguments": object, "timeout_ms"?: integer }`. `arguments` is required and must be a JSON object. `timeout_ms`, when supplied, must be 1 through 300000 milliseconds and must not exceed the host limit. | The original downstream MCP `CallToolResult`, not a host wrapper. |
+| `call_tools` | `{ "calls": [{ "server_id": string, "tool_name": string, "arguments"?: object, "timeout_ms"?: integer }] }`, with 1 through 32 items. `arguments` defaults to `{}`; each server must already be connected. | `structuredContent.results`; each item is a `success` result or an `error` with `RuntimeError`, in input order. |
 | `status` | No arguments. | Structured `HostStatus`: daemon and protocol versions, start time and uptime, registry, connected, failed, and active-session counts, listener readiness, and shutdown state. |
 | `refresh_server` | `{ "server_id": string }` | Structured `ToolSnapshot` fetched again from the connected downstream server. |
 
 All host-produced structured outputs contain both a short human-readable text
 content block and `structuredContent`. The downstream result from `call_tool`
 is the exception because it is passed through as an MCP result.
+
+`call_tools` runs items in parallel but preserves input order. Each successful
+item preserves the original downstream `content`, `structuredContent`,
+`isError`, and `_meta`; `isError: true` is not a host error. Only a batch-level
+validation failure, such as an empty or over-32-item `calls` array, becomes a
+top-level MCP error. Item runtime failures remain result items and do not cancel
+other calls.
 
 ## Results And Errors
 
@@ -83,11 +91,12 @@ Use the host as a control plane for downstream MCP servers:
 4. Call `list_tools` and select a discovered downstream tool from its schema.
 5. Call `call_tool` with the selected `server_id`, `tool_name`, and object
    `arguments`.
-6. Preserve and interpret an upstream `isError: true` result as a tool result,
+6. Use `call_tools` when several already-connected calls should run in parallel.
+7. Preserve and interpret an upstream `isError: true` result as a tool result,
    not as a transport failure.
-7. Call `refresh_server` when tool availability may have changed, then use the
+8. Call `refresh_server` when tool availability may have changed, then use the
    refreshed snapshot before making another routed call.
-8. Call `disconnect_server` when that downstream server is no longer needed.
+9. Call `disconnect_server` when that downstream server is no longer needed.
 
 `status` is available at any point to observe host and downstream runtime
 health.

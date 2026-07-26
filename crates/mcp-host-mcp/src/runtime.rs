@@ -13,10 +13,11 @@ use std::{
 use futures_util::future::join_all;
 use http::{HeaderName, HeaderValue};
 use mcp_host_core::{
+    BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult,
     ConnectDisposition, ConnectResult, DesiredConnection, DisconnectDisposition, DisconnectResult,
-    Lifecycle, LifecycleState, McpServerRegistry, RegisteredServer, ResolvedTransportConfig,
-    RuntimeError, RuntimeErrorCode, ServerId, ServerInspection, ServerSummary, ToolCallResult,
-    ToolDefinition, ToolSnapshot, TransportKind,
+    Lifecycle, LifecycleState, MAX_BATCH_CALLS, McpServerRegistry, RegisteredServer,
+    ResolvedTransportConfig, RuntimeError, RuntimeErrorCode, ServerId, ServerInspection,
+    ServerSummary, ToolCallResult, ToolDefinition, ToolSnapshot, TransportKind,
 };
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{
@@ -184,6 +185,44 @@ impl RuntimeManager {
             error_code
         );
         result
+    }
+
+    /// Calls up to 32 discovered tools concurrently while preserving input order.
+    pub async fn call_tools(
+        &self,
+        calls: Vec<BatchToolCall>,
+    ) -> Result<BatchToolCallResponse, RuntimeError> {
+        if calls.is_empty() || calls.len() > MAX_BATCH_CALLS {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidArguments,
+                "call_tools",
+                format!("batch must contain between 1 and {MAX_BATCH_CALLS} tool calls"),
+            ));
+        }
+
+        let results = join_all(calls.into_iter().map(|call| async move {
+            let BatchToolCall {
+                server_id,
+                tool_name,
+                arguments,
+                timeout_ms,
+            } = call;
+            let outcome = match self
+                .call_tool(&server_id, &tool_name, arguments, timeout_ms)
+                .await
+            {
+                Ok(result) => BatchToolCallOutcome::Success { result },
+                Err(error) => BatchToolCallOutcome::Error { error },
+            };
+            BatchToolCallResult {
+                server_id,
+                tool_name,
+                outcome,
+            }
+        }))
+        .await;
+
+        Ok(BatchToolCallResponse { results })
     }
 
     /// Gracefully disconnects all registered servers concurrently.

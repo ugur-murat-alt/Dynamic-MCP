@@ -855,7 +855,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-host-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "secrecy",
  "serde",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-host-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "futures-util",

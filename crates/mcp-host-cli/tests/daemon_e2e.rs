@@ -45,6 +45,49 @@ async fn real_daemon_and_cli_flow_persists_state_between_commands() {
         "CLI works"
     );
 
+    let batch_started = Instant::now();
+    let batched = daemon.cli_json(&[
+        "batch",
+        "--calls",
+        r#"[{"server_id":"fixture","tool_name":"sleep","arguments":{"milliseconds":500}},{"server_id":"fixture","tool_name":"sleep","arguments":{"milliseconds":500}},{"server_id":"fixture","tool_name":"echo","arguments":{"message":"batch CLI"}}]"#,
+    ]);
+    assert_success(&batched);
+    assert!(batch_started.elapsed() < Duration::from_millis(900));
+    let batched = parse_stdout(&batched);
+    assert_eq!(batched["results"][0]["status"], "success");
+    assert_eq!(batched["results"][1]["status"], "success");
+    assert_eq!(
+        batched["results"][2]["result"]["structuredContent"]["message"],
+        "batch CLI"
+    );
+
+    let partial_error = daemon.cli_json(&[
+        "batch",
+        "--calls",
+        r#"[{"server_id":"fixture","tool_name":"missing"},{"server_id":"fixture","tool_name":"echo","arguments":{"message":"survived"}}]"#,
+    ]);
+    assert_eq!(partial_error.status.code(), Some(4));
+    let partial_error = parse_stdout(&partial_error);
+    assert_eq!(
+        partial_error["results"][0]["error"]["code"],
+        "TOOL_NOT_FOUND"
+    );
+    assert_eq!(
+        partial_error["results"][1]["result"]["structuredContent"]["message"],
+        "survived"
+    );
+
+    let upstream_error = daemon.cli_json(&[
+        "batch",
+        "--calls",
+        r#"[{"server_id":"fixture","tool_name":"fail"}]"#,
+    ]);
+    assert_eq!(upstream_error.status.code(), Some(5));
+    assert_eq!(
+        parse_stdout(&upstream_error)["results"][0]["result"]["isError"],
+        true
+    );
+
     let refreshed = daemon.cli_json(&["refresh", "fixture"]);
     assert_success(&refreshed);
     assert_eq!(parse_stdout(&refreshed)["tool_count"], 5);
@@ -77,6 +120,7 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
         tools,
         [
             "call_tool",
+            "call_tools",
             "connect_server",
             "disconnect_server",
             "inspect_server",
@@ -128,6 +172,33 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
         echo.structured_content.as_ref().expect("structured")["message"],
         "full chain"
     );
+
+    let batch = call_host_tool(
+        &client,
+        "call_tools",
+        json!({
+            "calls": [
+                {
+                    "server_id": "fixture",
+                    "tool_name": "echo",
+                    "arguments": {"message": "host batch"}
+                },
+                {"server_id": "fixture", "tool_name": "missing"},
+                {"server_id": "fixture", "tool_name": "fail"}
+            ]
+        }),
+    )
+    .await;
+    let batch = batch.structured_content.as_ref().expect("structured");
+    assert_eq!(batch["results"][0]["tool_name"], "echo");
+    assert_eq!(
+        batch["results"][0]["result"]["structuredContent"]["message"],
+        "host batch"
+    );
+    assert_eq!(batch["results"][1]["status"], "error");
+    assert_eq!(batch["results"][1]["error"]["code"], "TOOL_NOT_FOUND");
+    assert_eq!(batch["results"][2]["status"], "success");
+    assert_eq!(batch["results"][2]["result"]["isError"], true);
 
     call_host_tool(
         &client,

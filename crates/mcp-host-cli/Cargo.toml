@@ -12,8 +12,8 @@ directories = "6"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
 interprocess = { version = "=2.4.2", features = ["tokio"] }
-mcp-host-core = { version = "0.1.0", path = "../mcp-host-core" }
-mcp-host-mcp = { version = "0.1.0", path = "../mcp-host-mcp" }
+mcp-host-core = { version = "0.1.1", path = "../mcp-host-core" }
+mcp-host-mcp = { version = "0.1.1", path = "../mcp-host-mcp" }
 rmcp = "=2.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

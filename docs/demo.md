@@ -52,6 +52,13 @@ mcp-host call fixture add \
   --runtime-dir target/mcp-host-runtime \
   --json
 
+# The server is already connected. The two sleeps run concurrently with echo.
+mcp-host batch --calls '[
+  {"server_id":"fixture","tool_name":"sleep","arguments":{"milliseconds":500}},
+  {"server_id":"fixture","tool_name":"sleep","arguments":{"milliseconds":500}},
+  {"server_id":"fixture","tool_name":"echo","arguments":{"message":"parallel"}}
+]' --runtime-dir target/mcp-host-runtime --json
+
 mcp-host refresh fixture --runtime-dir target/mcp-host-runtime --json
 
 mcp-host inspect fixture --runtime-dir target/mcp-host-runtime --json
@@ -69,6 +76,21 @@ Expected evidence includes:
 - `tools` includes `echo`, `add`, `sleep`, `fail`, and `crash`.
 - `echo` returns `structuredContent.message` unchanged.
 - `add` returns `structuredContent.sum` equal to `5`.
+- The batch finishes in roughly one 500 ms sleep interval, not two, and returns
+  three results in the submitted order. Its JSON shape is:
+
+  ```json
+  {
+    "results": [
+      { "server_id": "fixture", "tool_name": "sleep", "status": "success", "result": { "content": [] } },
+      { "server_id": "fixture", "tool_name": "sleep", "status": "success", "result": { "content": [] } },
+      { "server_id": "fixture", "tool_name": "echo", "status": "success", "result": { "content": [{ "type": "text", "text": "parallel" }] } }
+    ]
+  }
+  ```
+
+  Successful items retain the upstream result fields, including
+  `structuredContent`, `isError`, and `_meta` when present.
 - `inspect` exposes no environment or header values.
 - `daemon stop` returns `{"accepted":true}` and Terminal 1 exits.
 - `control.sock`, `mcp.sock`, `daemon.json`, and `daemon.lock` are removed on
@@ -83,7 +105,7 @@ Start the daemon again, then configure an MCP client to execute:
   --runtime-dir /absolute/path/to/target/mcp-host-runtime
 ```
 
-The Host MCP Server advertises exactly eight tools. A client should call:
+The Host MCP Server advertises exactly nine tools. A client should call:
 
 ```text
 list_servers
@@ -91,6 +113,7 @@ inspect_server
 connect_server
 list_tools
 call_tool
+call_tools (for parallel already-connected calls)
 refresh_server (when needed)
 disconnect_server
 ```

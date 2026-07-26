@@ -60,6 +60,21 @@ There is no runtime-wide mutex around connection, discovery, or tool I/O.
 Calls use a clone of the connected RMCP `Peer`, so unrelated tool requests may
 proceed concurrently and do not hold the lifecycle mutex.
 
+## Batch Invocation
+
+`call_tools` accepts 1 through 32 call items and requires every referenced
+server to be connected already. It never starts an implicit connection. The
+runtime dispatches all items with `join_all`, so calls to the same server and to
+different servers make real concurrent progress. Results are reordered to match
+the input array.
+
+Each item has `server_id`, `tool_name`, optional object `arguments` (default
+`{}`), and optional `timeout_ms`. A runtime failure produces an item with
+`status: "error"` and a safe `RuntimeError`; it does not cancel sibling calls.
+A downstream response produces `status: "success"` and is preserved unchanged,
+including `content`, `structuredContent`, `isError`, and `_meta`. In particular,
+`isError: true` is a successful upstream transport response.
+
 ## Stdio Upstream
 
 For a `stdio` manifest, the manager creates an RMCP `TokioChildProcess` from a
@@ -100,6 +115,7 @@ Runtime defaults are exact and centralized in `RuntimeSettings`:
 | Transport connect, initialize, initial discovery | 15 seconds | A timeout fails the connection; the active stdio service also receives its connect cancellation token. |
 | Tool call without `timeout_ms` | 60 seconds | RMCP cancellable request timeout. |
 | Caller `timeout_ms` | caller value | Must be 1..=300000 ms and no greater than the configured 300-second maximum. |
+| Batch control request | `max(base control timeout, longest effective item timeout + 5 seconds)` | Each control request and response remains limited to 8 MiB. |
 | Explicit tool-cache refresh | 60 seconds | On failure or timeout, prior cache remains stale. |
 | Graceful session close | 4 seconds | Failure is a disconnect failure. |
 

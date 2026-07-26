@@ -38,11 +38,10 @@ validation.
 
 ## Current Suite
 
-The current suite contains **105 tests** under
-`cargo test --workspace --all-features -- --list`: 86 unit tests and 19
-integration or end-to-end tests. There are currently no doctests. This count is
-an inventory of the current working tree and may change as the final suite
-changes.
+The v0.1.1 full suite contains **113 tests** under
+`cargo test --workspace --all-features -- --list`: 93 unit tests and 20
+integration or end-to-end tests, with 0 ignored. There are currently no
+doctests.
 
 | Area | Count | Coverage |
 | --- | ---: | --- |
@@ -50,6 +49,7 @@ changes.
 | `mcp-host-core` integration | 3 | Real manifest directories, duplicate IDs, example manifests, resolved values, and secret-free debug output. |
 | `mcp-host-mcp` unit | 15 | Fixed Host Server tool surface and metadata, schema requirements, runtime error mapping, upstream `isError` preservation, session accounting, fixture behavior, runtime preconditions, and streaming stderr redaction. |
 | CLI, harness, IPC, bridge, and daemon unit | 27 | Detailed help and harness parsing, shell-free harness argv generation, absolute runtime paths, exit codes, length-prefixed IPC framing, endpoint validation, bidirectional bridge byte forwarding and EOF draining, daemon metadata, protocol mismatch, and empty-registry control requests. |
+| Batch unit and end-to-end | 8 | Batch input validation, explicit-connect and shutdown preconditions, `join_all` concurrency and input ordering, item error isolation, result preservation, derived control timeout, and CLI exit precedence. |
 | Real stdio runtime end-to-end | 7 | Downstream process initialization, discovery, calls, timeout reuse, concurrent lifecycle operations, cancellation ordering, crashes, reconnects, and shared shutdown. |
 | Local Streamable HTTP end-to-end | 2 | HTTP initialization, resolved header delivery, secret redaction, paginated discovery, and stale cache preservation after refresh failure. |
 | Daemon and CLI end-to-end | 5 | Persistent CLI state, complete RMCP bridge chain, shared runtime, daemon exclusivity, and active-session shutdown. |
@@ -73,6 +73,8 @@ It verifies:
   they do not silently begin a second connection.
 - A fixture `crash` moves the runtime to `Failed`; a later connect starts a new
   process and successfully routes another call.
+- A batch with two 500 ms sleeps and an echo completes concurrently, keeps input
+  order, and leaves sibling results available when one item has a runtime error.
 
 `crates/mcp-host-mcp/tests/http_e2e.rs` runs real local Streamable HTTP RMCP
 servers. It verifies an environment-resolved secret header is delivered to the

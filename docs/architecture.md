@@ -77,7 +77,9 @@ Control IPC is a request/response protocol:
 - The control protocol version is `1`; clients verify both version and request
   ID before accepting a response.
 - Control operations are `ping`, `status`, server listing/inspection,
-  connect/disconnect, tool list/refresh/call, and shutdown.
+  connect/disconnect, tool list/refresh, single call, batch `call_tools`, and
+  shutdown. The protocol version remains `1`; v0.1.0 daemons do not understand
+  batch calls, so the CLI and daemon must be upgraded together.
 
 The MCP IPC listener is deliberately different. It is an unframed bidirectional
 byte stream. `mcp-host mcp` connects stdin/stdout directly to that stream with
@@ -97,13 +99,17 @@ daemon's shared `RuntimeManager`. Its tool list is fixed and deterministic:
 - `disconnect_server`
 - `list_tools`
 - `call_tool`
+- `call_tools`
 - `status`
 - `refresh_server`
 
 `call_tool` requires `server_id`, `tool_name`, and object-valued `arguments`.
-It forwards a valid downstream MCP tool result without semantic conversion.
-There is no dynamic injection of discovered tools into the host tool list and
-no semantic route per downstream tool. CLI commands dispatch the same manager
+`call_tools` accepts 1 through 32 already-connected call items and returns
+`structuredContent.results`. It runs them concurrently while retaining input
+order; individual runtime failures stay in that result array. Both operations
+preserve valid downstream results without semantic conversion. There is no
+dynamic injection of discovered tools into the host tool list and no
+`tools/list_changed` publication. CLI commands dispatch the same manager
 operations through control IPC.
 
 ## Lifecycle And Concurrency
@@ -121,6 +127,8 @@ the same server form a single flight: an operation has an epoch and
 `CancellationToken`, waiters use `Notify`, and a stale completion cannot replace
 a newer operation. Different servers connect and stop independently. Tool calls
 clone the connected RMCP peer and run outside the lifecycle critical section.
+Batch calls use `join_all` over those independent call futures, including calls
+targeting the same server, and reorder results to their original input positions.
 
 Disconnect during startup cancels the connect token, joins its completion, and
 then reports the resulting stopped state. An unexpected transport close marks a

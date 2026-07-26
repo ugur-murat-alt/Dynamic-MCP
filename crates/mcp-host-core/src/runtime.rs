@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::{DesiredConnection, LifecycleState};
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_BATCH_CALLS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -245,6 +246,40 @@ impl ToolCallResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchToolCall {
+    pub server_id: String,
+    pub tool_name: String,
+    #[serde(default = "default_tool_arguments")]
+    pub arguments: Value,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchToolCallResult {
+    pub server_id: String,
+    pub tool_name: String,
+    #[serde(flatten)]
+    pub outcome: BatchToolCallOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BatchToolCallOutcome {
+    Success { result: ToolCallResult },
+    Error { error: RuntimeError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchToolCallResponse {
+    pub results: Vec<BatchToolCallResult>,
+}
+
+fn default_tool_arguments() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlRequest {
     Ping,
@@ -268,6 +303,9 @@ pub enum ControlRequest {
         tool_name: String,
         arguments: Value,
         timeout_ms: Option<u64>,
+    },
+    CallTools {
+        calls: Vec<BatchToolCall>,
     },
     RefreshServer {
         server_id: String,
@@ -328,8 +366,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
+        BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult,
         CONTROL_PROTOCOL_VERSION, ControlRequest, ControlRequestEnvelope, ControlResponseEnvelope,
-        RuntimeError, RuntimeErrorCode,
+        RuntimeError, RuntimeErrorCode, ToolCallResult,
     };
 
     #[test]
@@ -426,6 +465,75 @@ mod tests {
         let encoded = serde_json::to_string(&request).expect("request should serialize");
         assert!(encoded.contains("\\n"));
         assert_eq!(round_trip(&request), request);
+    }
+
+    #[test]
+    fn batch_request_and_results_round_trip_in_input_order() {
+        let request = ControlRequestEnvelope::new(
+            "8",
+            ControlRequest::CallTools {
+                calls: vec![
+                    BatchToolCall {
+                        server_id: "one".to_owned(),
+                        tool_name: "echo".to_owned(),
+                        arguments: json!({"value": 1}),
+                        timeout_ms: Some(1_000),
+                    },
+                    BatchToolCall {
+                        server_id: "two".to_owned(),
+                        tool_name: "missing".to_owned(),
+                        arguments: json!({}),
+                        timeout_ms: None,
+                    },
+                ],
+            },
+        );
+        let response = BatchToolCallResponse {
+            results: vec![
+                BatchToolCallResult {
+                    server_id: "one".to_owned(),
+                    tool_name: "echo".to_owned(),
+                    outcome: BatchToolCallOutcome::Success {
+                        result: ToolCallResult::new(json!({"content": []})),
+                    },
+                },
+                BatchToolCallResult {
+                    server_id: "two".to_owned(),
+                    tool_name: "missing".to_owned(),
+                    outcome: BatchToolCallOutcome::Error {
+                        error: RuntimeError::for_server(
+                            RuntimeErrorCode::ToolNotFound,
+                            "call_tool",
+                            "two",
+                            "the requested tool was not discovered",
+                        ),
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(round_trip(&request), request);
+        assert_eq!(round_trip(&response), response);
+        assert!(matches!(
+            response.results[0].outcome,
+            BatchToolCallOutcome::Success { .. }
+        ));
+        assert!(matches!(
+            response.results[1].outcome,
+            BatchToolCallOutcome::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_call_defaults_missing_arguments_to_an_object() {
+        let call: BatchToolCall = serde_json::from_value(json!({
+            "server_id": "fixture",
+            "tool_name": "echo"
+        }))
+        .expect("batch call should deserialize");
+
+        assert_eq!(call.arguments, json!({}));
+        assert_eq!(call.timeout_ms, None);
     }
 
     #[test]

@@ -367,6 +367,9 @@ async fn dispatch_request(
             .call_tool(&server_id, &tool_name, arguments, timeout_ms)
             .await?
             .into_value()),
+        ControlRequest::CallTools { calls } => {
+            json_value("call_tools", runtime.call_tools(calls).await?)
+        }
         ControlRequest::RefreshServer { server_id } => {
             json_value("refresh_server", runtime.refresh_server(&server_id).await?)
         }
@@ -391,6 +394,7 @@ fn control_operation(request: &ControlRequest) -> &'static str {
         ControlRequest::DisconnectServer { .. } => "disconnect_server",
         ControlRequest::ListTools { .. } => "list_tools",
         ControlRequest::CallTool { .. } => "call_tool",
+        ControlRequest::CallTools { .. } => "call_tools",
         ControlRequest::RefreshServer { .. } => "refresh_server",
         ControlRequest::Shutdown => "shutdown",
     }
@@ -595,13 +599,15 @@ fn daemon_shutting_down_error() -> RuntimeError {
 mod tests {
     use std::{error::Error, sync::Arc};
 
-    use mcp_host_core::{HostStatus, ManifestLoader, ProcessEnvironment, RegistryBuilder};
+    use mcp_host_core::{
+        BatchToolCall, HostStatus, ManifestLoader, ProcessEnvironment, RegistryBuilder,
+    };
     use mcp_host_mcp::{HostRuntimeState, RuntimeManager, RuntimeSettings};
     use serde_json::json;
 
     use super::{
         CONTROL_PROTOCOL_VERSION, ControlRequest, DaemonMetadata, RuntimeErrorCode,
-        dispatch_request, protocol_mismatch_error,
+        allowed_during_shutdown, dispatch_request, protocol_mismatch_error,
     };
 
     #[test]
@@ -613,7 +619,7 @@ mod tests {
             control_endpoint: "runtime/control.sock".to_owned(),
             mcp_endpoint: "runtime/mcp.sock".to_owned(),
             config_dir: "config".into(),
-            binary_version: "0.1.0".to_owned(),
+            binary_version: env!("CARGO_PKG_VERSION").to_owned(),
         };
 
         let value = serde_json::to_value(&metadata)?;
@@ -635,6 +641,28 @@ mod tests {
             response.error.map(|error| error.code),
             Some(RuntimeErrorCode::IpcProtocolMismatch)
         );
+    }
+
+    #[test]
+    fn tool_calls_are_rejected_during_shutdown() {
+        let call = ControlRequest::CallTool {
+            server_id: "fixture".to_owned(),
+            tool_name: "echo".to_owned(),
+            arguments: json!({}),
+            timeout_ms: None,
+        };
+        let batch = ControlRequest::CallTools {
+            calls: vec![BatchToolCall {
+                server_id: "fixture".to_owned(),
+                tool_name: "echo".to_owned(),
+                arguments: json!({}),
+                timeout_ms: None,
+            }],
+        };
+
+        assert!(!allowed_during_shutdown(&call));
+        assert!(!allowed_during_shutdown(&batch));
+        assert!(allowed_during_shutdown(&ControlRequest::Status));
     }
 
     #[tokio::test]

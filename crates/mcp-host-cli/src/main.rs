@@ -6,10 +6,15 @@ use std::{
 
 use clap::Parser as _;
 use directories::ProjectDirs;
-use mcp_host::cli::{Call, Cli, Command, DaemonCommand, ExitCode as CliExitCode, HarnessCommand};
+use mcp_host::cli::{
+    Batch, Call, Cli, Command, DaemonCommand, ExitCode as CliExitCode, HarnessCommand,
+};
 use mcp_host::ipc::send_control;
 use mcp_host::{DaemonOptions, install_harnesses, run_daemon, run_stdio_bridge};
-use mcp_host_core::{ControlRequest, RuntimeError, RuntimeErrorCode};
+use mcp_host_core::{
+    BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, ControlRequest, RuntimeError,
+    RuntimeErrorCode,
+};
 use serde_json::{Value, json};
 
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(65);
@@ -165,6 +170,26 @@ async fn execute(cli: Cli) -> Result<CliExitCode, RuntimeError> {
                 },
             )
         }
+        Command::Batch(batch) => {
+            let mut calls = read_batch_calls(&batch).await?;
+            for call in &mut calls {
+                if call.timeout_ms.is_none() {
+                    call.timeout_ms = timeout;
+                }
+            }
+            let batch_timeout = batch_control_timeout(control_timeout, &calls);
+            let result = send_control(
+                &runtime_dir,
+                &ControlRequest::CallTools { calls },
+                batch_timeout,
+            )
+            .await?;
+            let response: BatchToolCallResponse =
+                serde_json::from_value(result.clone()).map_err(|_| batch_response_error())?;
+            let exit_code = batch_exit_code(&response);
+            write_value(&result, json)?;
+            Ok(exit_code)
+        }
         Command::Status => {
             execute_control(&runtime_dir, ControlRequest::Status, control_timeout, json).await
         }
@@ -235,11 +260,76 @@ async fn read_call_arguments(call: &Call) -> Result<Value, RuntimeError> {
     }
 }
 
+async fn read_batch_calls(batch: &Batch) -> Result<Vec<BatchToolCall>, RuntimeError> {
+    let calls = match (&batch.calls, &batch.calls_file) {
+        (Some(calls), None) => calls.as_bytes().to_vec(),
+        (None, Some(path)) if path == Path::new("-") => {
+            let mut calls = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut calls)
+                .await
+                .map_err(|_| batch_arguments_error())?;
+            calls
+        }
+        (None, Some(path)) => tokio::fs::read(path)
+            .await
+            .map_err(|_| batch_arguments_error())?,
+        _ => return Err(batch_arguments_error()),
+    };
+
+    serde_json::from_slice(&calls).map_err(|_| batch_arguments_error())
+}
+
+fn batch_control_timeout(base: Duration, calls: &[BatchToolCall]) -> Duration {
+    calls
+        .iter()
+        .filter_map(|call| call.timeout_ms)
+        .max()
+        .map_or(base, |timeout_ms| {
+            base.max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5)))
+        })
+}
+
+fn batch_exit_code(response: &BatchToolCallResponse) -> CliExitCode {
+    if response
+        .results
+        .iter()
+        .any(|result| matches!(result.outcome, BatchToolCallOutcome::Error { .. }))
+    {
+        return CliExitCode::RuntimeFailure;
+    }
+    if response.results.iter().any(|item| {
+        matches!(
+            &item.outcome,
+            BatchToolCallOutcome::Success { result }
+                if result.value().get("isError").and_then(Value::as_bool) == Some(true)
+        )
+    }) {
+        return CliExitCode::UpstreamToolError;
+    }
+    CliExitCode::Success
+}
+
 fn invalid_arguments_error() -> RuntimeError {
     RuntimeError::new(
         RuntimeErrorCode::InvalidArguments,
         "call_arguments",
         "tool arguments must be a JSON object",
+    )
+}
+
+fn batch_arguments_error() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::InvalidArguments,
+        "batch_arguments",
+        "batch calls must be a JSON array of {server_id, tool_name, arguments?, timeout_ms?} items",
+    )
+}
+
+fn batch_response_error() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::ProtocolError,
+        "call_tools",
+        "daemon returned an invalid batch response",
     )
 }
 
@@ -285,4 +375,65 @@ fn exit_code_for_error(error: &RuntimeError) -> CliExitCode {
 
 fn process_exit_code(exit_code: CliExitCode) -> std::process::ExitCode {
     std::process::ExitCode::from(exit_code as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use mcp_host_core::{
+        BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult, RuntimeError,
+        RuntimeErrorCode, ToolCallResult,
+    };
+    use serde_json::json;
+
+    use super::{BatchToolCall, CliExitCode, Duration, batch_control_timeout, batch_exit_code};
+
+    #[test]
+    fn batch_exit_code_reflects_item_errors_and_upstream_tool_errors() {
+        let clean = response(BatchToolCallOutcome::Success {
+            result: ToolCallResult::new(json!({"isError": false})),
+        });
+        let upstream_error = response(BatchToolCallOutcome::Success {
+            result: ToolCallResult::new(json!({"isError": true})),
+        });
+        let runtime_error = response(BatchToolCallOutcome::Error {
+            error: RuntimeError::for_server(
+                RuntimeErrorCode::ToolNotFound,
+                "call_tool",
+                "fixture",
+                "the requested tool was not discovered",
+            ),
+        });
+
+        assert_eq!(batch_exit_code(&clean), CliExitCode::Success);
+        assert_eq!(
+            batch_exit_code(&upstream_error),
+            CliExitCode::UpstreamToolError
+        );
+        assert_eq!(batch_exit_code(&runtime_error), CliExitCode::RuntimeFailure);
+    }
+
+    #[test]
+    fn batch_control_timeout_covers_the_longest_item() {
+        let calls = [BatchToolCall {
+            server_id: "fixture".to_owned(),
+            tool_name: "sleep".to_owned(),
+            arguments: json!({}),
+            timeout_ms: Some(300_000),
+        }];
+
+        assert_eq!(
+            batch_control_timeout(Duration::from_secs(65), &calls),
+            Duration::from_secs(305)
+        );
+    }
+
+    fn response(outcome: BatchToolCallOutcome) -> BatchToolCallResponse {
+        BatchToolCallResponse {
+            results: vec![BatchToolCallResult {
+                server_id: "fixture".to_owned(),
+                tool_name: "echo".to_owned(),
+                outcome,
+            }],
+        }
+    }
 }

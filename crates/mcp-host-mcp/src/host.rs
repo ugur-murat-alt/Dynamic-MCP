@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mcp_host_core::{HostStatus, RuntimeError, RuntimeErrorCode};
+use mcp_host_core::{BatchToolCall, HostStatus, RuntimeError, RuntimeErrorCode};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 use crate::RuntimeManager;
 
 const SERVER_DESCRIPTION: &str = "A long-running MCP runtime and process manager that presents one stable MCP server to AI clients while managing manifest-defined MCP servers as downstream clients.";
-const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers.\n2. Call inspect_server to review a server's public configuration and current state.\n3. Call connect_server before using a disconnected server.\n4. Call list_tools after connecting to discover that server's available tools.\n5. Call call_tool with the selected server, tool name, and JSON object arguments.\n6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.";
+const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers.\n2. Call inspect_server to review a server's public configuration and current state.\n3. Call connect_server before using a disconnected server.\n4. Call list_tools after connecting to discover that server's available tools.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.\n6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.";
 
 /// Shared process state owned by the daemon hosting inbound MCP sessions.
 pub struct HostRuntimeState {
@@ -189,6 +189,21 @@ impl<'de> Deserialize<'de> for CallToolParams {
     }
 }
 
+#[derive(Deserialize, JsonSchema)]
+struct CallToolsParams {
+    calls: Vec<BatchToolCallParams>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct BatchToolCallParams {
+    server_id: String,
+    tool_name: String,
+    #[serde(default)]
+    arguments: Map<String, Value>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
 #[tool_router]
 impl HostMcpServer {
     #[tool(description = "List registered downstream MCP servers and their runtime state.")]
@@ -272,6 +287,34 @@ impl HostMcpServer {
             .await
             .map_err(runtime_error)?;
         decode_downstream_result(result.into_value())
+    }
+
+    #[tool(
+        description = "Call between 1 and 32 discovered tools concurrently. Results preserve input order; item runtime errors are embedded without cancelling other calls."
+    )]
+    async fn call_tools(
+        &self,
+        Parameters(CallToolsParams { calls }): Parameters<CallToolsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let calls = calls
+            .into_iter()
+            .map(|call| BatchToolCall {
+                server_id: call.server_id,
+                tool_name: call.tool_name,
+                arguments: Value::Object(call.arguments),
+                timeout_ms: call.timeout_ms,
+            })
+            .collect();
+        let response = self
+            .runtime
+            .call_tools(calls)
+            .await
+            .map_err(runtime_error)?;
+        let text = format!(
+            "Completed {} concurrent downstream tool calls.",
+            response.results.len()
+        );
+        structured_result(response, &text)
     }
 
     #[tool(description = "Return Dynamic MCP Host process and downstream runtime status.")]
@@ -380,6 +423,7 @@ mod tests {
             server.tool_names(),
             [
                 "call_tool",
+                "call_tools",
                 "connect_server",
                 "disconnect_server",
                 "inspect_server",
@@ -417,6 +461,23 @@ mod tests {
         assert!(required.contains(&json!("tool_name")));
         assert!(required.contains(&json!("arguments")));
         assert_eq!(schema["properties"]["arguments"]["type"], json!("object"));
+    }
+
+    #[test]
+    fn call_tools_schema_requires_a_calls_array() {
+        let server = server();
+        let tool = server
+            .tool_router
+            .get("call_tools")
+            .cloned()
+            .expect("call_tools should be registered");
+        let schema = tool.schema_as_json_value();
+        let required = schema["required"]
+            .as_array()
+            .expect("call_tools required fields should be an array");
+
+        assert!(required.contains(&json!("calls")));
+        assert_eq!(schema["properties"]["calls"]["type"], json!("array"));
     }
 
     #[test]

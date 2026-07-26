@@ -4,6 +4,9 @@ Dynamic MCP Host V1 is a long-running, registry-backed MCP runtime. It exposes
 one fixed MCP server to AI clients while acting as an MCP client to manifest-
 defined stdio and Streamable HTTP servers.
 
+The v0.1.1 release adds parallel batch tool invocation while retaining the
+fixed host tool surface and control protocol v1.
+
 The host manages registration, connection lifecycle, tool discovery, caching,
 refresh, invocation, timeout, and shutdown. It does not perform semantic
 routing, choose tools, load skills, or inject upstream tools into its own tool
@@ -108,7 +111,7 @@ mcp-host list --runtime-dir target/mcp-host-runtime
 mcp-host connect fixture --runtime-dir target/mcp-host-runtime
 ```
 
-Connections are explicit. `tools` and `call` never connect silently.
+Connections are explicit. `tools`, `call`, and `batch` never connect silently.
 
 ## 6. List Tools
 
@@ -164,6 +167,24 @@ Source: [VS Code MCP configuration reference](https://code.visualstudio.com/docs
 
 `mcp-host mcp` is a transparent byte bridge. It does not parse MCP or run
 business logic, and its stdout is reserved exclusively for protocol traffic.
+
+## Batch Calls
+
+After explicitly connecting every referenced server, invoke 1 through 32 tools
+in one request:
+
+```bash
+mcp-host batch --calls '[
+  {"server_id":"fixture","tool_name":"echo","arguments":{"message":"first"}},
+  {"server_id":"fixture","tool_name":"echo","arguments":{"message":"second"}}
+]'
+```
+
+Use `--calls-file <PATH>` (or `-` for stdin) instead of `--calls`; exactly one
+input is required. Calls run in parallel, including calls to the same server,
+but results retain input order. See [CLI](docs/cli.md) and
+[Runtime](docs/runtime.md) for the input, timeout, result, and exit-status
+contracts.
 
 ## 9. Shutdown
 

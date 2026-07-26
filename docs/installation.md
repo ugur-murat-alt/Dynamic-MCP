@@ -22,8 +22,12 @@ Install a pinned release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh \
-  | sh -s -- --version v0.1.0
+  | sh -s -- --version v0.1.1
 ```
+
+`v0.1.0` remains an earlier release; pin `v0.1.1` for the batch-call CLI and
+host-MCP support. Upgrade the CLI and running daemon together, because an older
+daemon does not recognize batch control requests.
 
 Choose another destination:
 

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 /// Command-line interface for the MCP host.
 #[derive(Debug, Parser)]
@@ -11,7 +11,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     arg_required_else_help = true,
     about = "Run and control a shared Dynamic MCP Host",
     long_about = "Run and control a shared Dynamic MCP Host.\n\nThe daemon owns upstream MCP sessions. Ordinary CLI commands use the control endpoint, while `mcp-host mcp` is a transparent stdio bridge for AI clients. Connections to configured upstream servers are always explicit.",
-    after_long_help = "Examples:\n  mcp-host daemon run --config-dir ./config\n  mcp-host connect filesystem\n  mcp-host call filesystem read_file --arguments '{\"path\":\"README.md\"}'\n  mcp-host harness install opencode\n  mcp-host harness install claude-code --scope user\n\nRun `mcp-host <command> --help` for command-specific details."
+    after_long_help = "Examples:\n  mcp-host daemon run --config-dir ./config\n  mcp-host connect filesystem\n  mcp-host call filesystem read_file --arguments '{\"path\":\"README.md\"}'\n  mcp-host batch --calls '[{\"server_id\":\"filesystem\",\"tool_name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}]'\n  mcp-host harness install opencode\n  mcp-host harness install claude-code --scope user\n\nRun `mcp-host <command> --help` for command-specific details."
 )]
 pub struct Cli {
     /// Directory containing daemon lock, metadata, and IPC endpoints.
@@ -72,6 +72,11 @@ pub enum Command {
     },
     /// Invoke one tool on an already connected upstream server.
     Call(Call),
+    /// Invoke up to 32 connected upstream tools concurrently.
+    #[command(
+        long_about = "Invoke between 1 and 32 tools concurrently across connected downstream MCP servers.\n\nResults preserve input order. A runtime error for one item is embedded in that item and does not cancel the remaining calls. Upstream MCP results, including isError, structuredContent, and _meta, are preserved."
+    )]
+    Batch(Batch),
     /// Show daemon health and aggregate runtime state.
     Status,
     /// Register the stdio bridge in a supported AI coding harness.
@@ -124,6 +129,22 @@ pub struct Call {
     /// Read the tool argument JSON object from a file, or `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "arguments")]
     pub arguments_file: Option<PathBuf>,
+}
+
+/// Arguments used to invoke a bounded batch of tools concurrently.
+#[derive(Debug, Args)]
+#[command(
+    group(ArgGroup::new("batch_input").required(true).args(["calls", "calls_file"])),
+    after_long_help = "Examples:\n  mcp-host batch --calls '[{\"server_id\":\"fixture\",\"tool_name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}]'\n  mcp-host batch --calls-file calls.json\n  cat calls.json | mcp-host batch --calls-file -"
+)]
+pub struct Batch {
+    /// Calls as an inline JSON array.
+    #[arg(long, value_name = "JSON")]
+    pub calls: Option<String>,
+
+    /// Read the calls JSON array from a file, or `-` for stdin.
+    #[arg(long, value_name = "PATH")]
+    pub calls_file: Option<PathBuf>,
 }
 
 /// Commands that integrate the stdio bridge with AI coding harnesses.
@@ -248,6 +269,12 @@ mod tests {
                 "--arguments",
                 "{\"key\":true}",
             ],
+            &[
+                "mcp-host",
+                "batch",
+                "--calls",
+                "[{\"server_id\":\"server-a\",\"tool_name\":\"tool-a\"}]",
+            ],
             &["mcp-host", "status"],
             &["mcp-host", "harness", "install", "opencode"],
             &[
@@ -301,6 +328,28 @@ mod tests {
     }
 
     #[test]
+    fn requires_exactly_one_batch_input() {
+        assert!(Cli::try_parse_from(["mcp-host", "batch"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "mcp-host",
+                "batch",
+                "--calls",
+                "[]",
+                "--calls-file",
+                "calls.json",
+            ])
+            .is_err()
+        );
+
+        let cli = parse(&["mcp-host", "batch", "--calls-file", "-"]);
+        let Command::Batch(batch) = cli.command else {
+            panic!("expected batch command");
+        };
+        assert_eq!(batch.calls_file, Some(PathBuf::from("-")));
+    }
+
+    #[test]
     fn validates_timeout_bounds() {
         assert!(Cli::try_parse_from(["mcp-host", "--timeout", "1", "list"]).is_ok());
         assert!(Cli::try_parse_from(["mcp-host", "--timeout", "300000", "list"]).is_ok());
@@ -347,6 +396,15 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("transparent stdio bridge"));
         assert!(help.contains("harness install claude-code --scope user"));
+
+        let mut command = Cli::command();
+        let batch_help = command
+            .find_subcommand_mut("batch")
+            .expect("batch command")
+            .render_long_help()
+            .to_string();
+        assert!(batch_help.contains("Results preserve input order"));
+        assert!(batch_help.contains("mcp-host batch --calls-file calls.json"));
     }
 
     #[test]

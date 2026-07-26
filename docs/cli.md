@@ -13,7 +13,7 @@ them before the command for consistency.
 | --- | --- |
 | `--runtime-dir <DIR>` | Directory containing the daemon lock, metadata, and endpoint state. Defaults on Unix to `$XDG_RUNTIME_DIR/mcp-host` when `XDG_RUNTIME_DIR` is non-empty; otherwise it uses the platform local-data directory plus `runtime`. |
 | `--json` | Write successful command output as compact JSON. Without it, successful values are pretty-printed JSON. Runtime errors are JSON on stdout only with this flag, except for `mcp`. |
-| `--timeout <MS>` | Control request deadline in milliseconds, inclusive range `1..=300000`; default is 65 seconds. For `call`, the same optional value is also sent to the daemon as the downstream tool timeout. |
+| `--timeout <MS>` | Control request deadline in milliseconds, inclusive range `1..=300000`; default is 65 seconds. For `call`, the same optional value is also sent to the daemon as the downstream tool timeout. Batch control deadlines are derived from their items. |
 | `-h`, `--help` | Show Clap-generated help for the selected command. `--help` includes detailed examples where available. |
 | `-V`, `--version` | Show the binary version. |
 
@@ -37,6 +37,7 @@ use a fixed 60-second deadline.
 | `tools <SERVER_ID> [--refresh]` | List a server's tools; `--refresh` refreshes first. | `mcp-host tools filesystem --refresh` |
 | `refresh <SERVER_ID>` | Refresh one server. | `mcp-host refresh filesystem` |
 | `call <SERVER_ID> <TOOL_NAME> [--arguments <JSON> | --arguments-file <PATH>]` | Invoke a tool. | `mcp-host call filesystem read_file --arguments '{"path":"README.md"}'` |
+| `batch --calls <JSON_ARRAY> | --calls-file <PATH\|->` | Invoke 1 through 32 already-connected tools in parallel. | `mcp-host batch --calls '[{"server_id":"fixture","tool_name":"echo"}]'` |
 | `status` | Read daemon status; equivalent control operation to `daemon status`. | `mcp-host status` |
 | `harness install <TARGET>` | Register the stdio bridge with `opencode`, `claude-code`, or `all`. | `mcp-host harness install all` |
 | `mcp` | Bridge stdin/stdout to the daemon's MCP endpoint. | `mcp-host mcp` |
@@ -44,6 +45,34 @@ use a fixed 60-second deadline.
 `--config-dir` belongs to `daemon run`; it is required and has no default.
 `--refresh` belongs only to `tools`. `call` requires the positional server ID
 and tool name. `--arguments` and `--arguments-file` are mutually exclusive.
+
+## Batch Calls
+
+`batch` requires exactly one of `--calls <JSON_ARRAY>` and
+`--calls-file <PATH|->`; `-` reads the JSON array from stdin. The array has 1
+through 32 items. Every item has this shape:
+
+```json
+{
+  "server_id": "fixture",
+  "tool_name": "echo",
+  "arguments": { "message": "hello" },
+  "timeout_ms": 1000
+}
+```
+
+`arguments` defaults to `{}` and `timeout_ms` is optional. Every target must
+already be connected: batch never connects a server implicitly. The daemon runs
+all items concurrently and returns items in input order. An item runtime failure
+has `"status":"error"` with a safe `RuntimeError`; it does not cancel the
+other items. A completed upstream invocation has `"status":"success"` and
+preserves its original `content`, `structuredContent`, `isError`, and `_meta`.
+An upstream `isError: true` is therefore a successful transport result, not an
+item runtime error.
+
+The batch control deadline is the greater of the base control timeout and the
+longest explicit or effective item timeout plus five seconds. The complete
+control request and response must each fit the 8 MiB IPC frame limit.
 
 ## Harness Installation
 
@@ -114,7 +143,11 @@ errors to stderr.
 | `2` | CLI usage/parsing error, including invalid or missing command arguments. |
 | `3` | Daemon IPC is unavailable or the daemon is not running. |
 | `4` | Other runtime failure, including invalid call arguments, configuration, protocol, or daemon failures. |
-| `5` | `call` returned a tool result with top-level `isError: true`. |
+| `5` | `call`, or a batch with no item runtime error, returned a tool result with top-level `isError: true`. |
+
+For `batch`, exit status `4` takes precedence when any item has
+`status: "error"`; otherwise status `5` indicates one or more successful item
+results with `isError: true`, and status `0` indicates neither condition.
 
 `mcp` never prints CLI JSON or human output to stdout. Start the daemon first,
 then let the MCP client own the bridge's stdin and stdout:

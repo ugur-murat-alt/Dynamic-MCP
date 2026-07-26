@@ -20,8 +20,10 @@ pub use manifest::{
 };
 pub use registry::{McpServerRegistry, RegisteredServer, RegistryBuildError, RegistryBuilder};
 pub use runtime::{
+    BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult,
     CONTROL_PROTOCOL_VERSION, ConnectResult, ControlRequest, ControlRequestEnvelope,
-    ControlResponseEnvelope, DisconnectResult, HostStatus, RuntimeError, RuntimeErrorCode,
-    ServerInspection, ServerSummary, ToolCallResult, ToolDefinition, ToolSnapshot, TransportKind,
+    ControlResponseEnvelope, DisconnectResult, HostStatus, MAX_BATCH_CALLS, RuntimeError,
+    RuntimeErrorCode, ServerInspection, ServerSummary, ToolCallResult, ToolDefinition,
+    ToolSnapshot, TransportKind,
 };
 pub use validation::{EnvironmentResolutionError, ManifestValidationError};

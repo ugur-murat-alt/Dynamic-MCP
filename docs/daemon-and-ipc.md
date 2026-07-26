@@ -64,8 +64,8 @@ behavior on Windows.
 
 ## Control Protocol
 
-Control protocol version is currently `1`. Each connection carries exactly one
-request and one response, then is closed. The payload is JSON framed as:
+Control protocol version remains `1` in v0.1.1. Each connection carries exactly
+one request and one response, then is closed. The payload is JSON framed as:
 
 ```text
 4-byte unsigned big-endian payload length
@@ -100,9 +100,15 @@ and `error`.
 
 Control request `type` values are `ping`, `status`, `list_servers`,
 `inspect_server`, `connect_server`, `disconnect_server`, `list_tools`,
-`call_tool`, `refresh_server`, and `shutdown`. Their fields mirror the CLI:
-`server_id`, `tool_name`, `arguments`, `refresh`, and `timeout_ms` where
-applicable.
+`call_tool`, `call_tools`, `refresh_server`, and `shutdown`. `call_tools` carries
+`calls`, an array of 1 through 32 `{server_id, tool_name, arguments?,
+timeout_ms?}` items. Its control deadline is the greater of the base control
+timeout and the longest explicit or effective item timeout plus five seconds.
+The request and response each remain subject to the 8 MiB frame limit.
+
+Protocol v1 is not a forward-compatible feature negotiation mechanism: a
+v0.1.0 daemon does not recognize `call_tools`. Upgrade the v0.1.1 CLI and daemon
+together.
 
 ## MCP Endpoint
 
