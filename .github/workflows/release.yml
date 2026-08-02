@@ -52,6 +52,7 @@ jobs:
           mkdir -p package dist
           cp "target/${{ matrix.target }}/release/${{ matrix.executable }}" package/
           cp README.md LICENSE package/
+          cp -R skills package/
           tar -czf "dist/$ASSET" -C package .
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then

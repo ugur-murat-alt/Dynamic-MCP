@@ -6,8 +6,8 @@ use std::{
 
 use futures_util::future::join_all;
 use mcp_host_core::{
-    BatchToolCall, BatchToolCallOutcome, LifecycleState, MAX_BATCH_CALLS, ManifestLoader,
-    ProcessEnvironment, RegistryBuilder,
+    BatchToolCall, BatchToolCallOutcome, LifecycleState, MAX_BATCH_CALLS, ManifestLoader, Policy,
+    ProcessEnvironment, RegistryBuilder, SkillCatalog, SkillRunStatus,
 };
 use mcp_host_mcp::{RuntimeManager, RuntimeSettings};
 use serde_json::json;
@@ -358,6 +358,222 @@ async fn unexpected_crash_becomes_failed_and_reconnects() {
         .expect("fixture should disconnect");
 }
 
+#[tokio::test]
+async fn enabled_reconnect_policy_recovers_without_an_explicit_connect() {
+    let fixture = FixtureRuntime::new_with_reconnect();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture")
+        .await
+        .expect("fixture should connect");
+
+    let _ = manager
+        .call_tool("fixture", "crash", json!({}), None)
+        .await
+        .expect_err("crash should close the transport");
+    fixture.wait_startup_count(2).await;
+    wait_for_state(&manager, LifecycleState::Connected).await;
+
+    let echo = manager
+        .call_tool("fixture", "echo", json!({"message": "automatic"}), None)
+        .await
+        .expect("automatically reconnected fixture should answer");
+    assert_eq!(echo.value()["structuredContent"]["message"], "automatic");
+    manager.shutdown().await.expect("fixture should shut down");
+}
+
+#[tokio::test]
+async fn runtime_skill_chains_typed_outputs_and_stops_on_tool_errors() {
+    let fixture = FixtureRuntime::new();
+    fs::write(
+        fixture.config_dir.join("chain.skill.toml"),
+        r#"
+            id = "echo-chain"
+            name = "Echo chain"
+            description = "Pass one result into the next step"
+
+            [[inputs]]
+            name = "message"
+            type = "string"
+
+            [[steps]]
+            id = "first"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "${input.message}" }
+
+            [[steps]]
+            id = "second"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "Again: ${steps.first.output.structuredContent.message}" }
+        "#,
+    )
+    .expect("chain skill should be written");
+    fs::write(
+        fixture.config_dir.join("fail.skill.toml"),
+        r#"
+            id = "fail-fast"
+            name = "Fail fast"
+            description = "Stop after a tool-level error"
+
+            [[steps]]
+            id = "fail"
+            server = "fixture"
+            tool = "fail"
+
+            [[steps]]
+            id = "never"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "not-called" }
+        "#,
+    )
+    .expect("fail-fast skill should be written");
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture")
+        .await
+        .expect("fixture should connect");
+
+    assert_eq!(manager.list_skills().await.len(), 2);
+    let chained = manager
+        .run_skill("echo-chain", json!({"message": "hello"}))
+        .await
+        .expect("chain should run");
+    assert_eq!(chained.status, SkillRunStatus::Ok);
+    assert_eq!(chained.steps_completed, 2);
+    assert_eq!(
+        chained.results[1].result.value()["structuredContent"]["message"],
+        "Again: hello"
+    );
+
+    let failed = manager
+        .run_skill("fail-fast", json!({}))
+        .await
+        .expect("tool-level errors should produce a structured skill result");
+    assert_eq!(failed.status, SkillRunStatus::Error);
+    assert_eq!(failed.results.len(), 1);
+    assert_eq!(failed.steps_completed, 0);
+    let failure = failed.failure.expect("failure metadata should exist");
+    assert_eq!(failure.step_index, 0);
+    assert_eq!(failure.error.code.as_str(), "SKILL_UPSTREAM_ERROR");
+    manager.shutdown().await.expect("fixture should stop");
+}
+
+#[tokio::test]
+async fn runtime_skill_rechecks_call_policy_for_every_step() {
+    let fixture = FixtureRuntime::new();
+    fs::write(
+        fixture.config_dir.join("policy.skill.toml"),
+        r#"
+            id = "policy-stop"
+            name = "Policy stop"
+            description = "Stop when a step is denied"
+
+            [[steps]]
+            id = "allowed"
+            server = "fixture"
+            tool = "add"
+            arguments = { a = 2, b = 3 }
+
+            [[steps]]
+            id = "denied"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "blocked" }
+
+            [[steps]]
+            id = "never"
+            server = "fixture"
+            tool = "fail"
+        "#,
+    )
+    .expect("policy skill should be written");
+    fs::write(
+        fixture.config_dir.join("policy.toml"),
+        r#"
+            [[rules]]
+            id = "deny-echo"
+            action = "call"
+            effect = "deny"
+            server = "fixture"
+            tool = "echo"
+        "#,
+    )
+    .expect("policy should be written");
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture")
+        .await
+        .expect("fixture should connect");
+
+    let result = manager
+        .run_skill("policy-stop", json!({}))
+        .await
+        .expect("step denial should be embedded with partial results");
+    assert_eq!(result.status, SkillRunStatus::Error);
+    assert_eq!(result.steps_completed, 1);
+    assert_eq!(result.results.len(), 1);
+    let failure = result.failure.expect("failure metadata should exist");
+    assert_eq!(failure.step_index, 1);
+    assert_eq!(failure.error.code.as_str(), "POLICY_DENIED");
+    manager.shutdown().await.expect("fixture should stop");
+}
+
+#[tokio::test]
+async fn running_skill_finishes_its_snapshot_during_catalog_reload() {
+    let fixture = FixtureRuntime::new();
+    fs::write(
+        fixture.config_dir.join("snapshot.skill.toml"),
+        r#"
+            id = "snapshot"
+            name = "Snapshot"
+            description = "Complete an immutable running definition"
+
+            [[steps]]
+            id = "wait"
+            server = "fixture"
+            tool = "sleep"
+            arguments = { milliseconds = 200 }
+
+            [[steps]]
+            id = "echo"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "completed" }
+        "#,
+    )
+    .expect("snapshot skill should be written");
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture")
+        .await
+        .expect("fixture should connect");
+    let running = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.run_skill("snapshot", json!({})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let reload = manager
+        .reload_configuration(
+            manager.registry().await,
+            Policy::default(),
+            SkillCatalog::default(),
+        )
+        .await;
+    assert!(reload.skills_changed);
+    assert!(manager.list_skills().await.is_empty());
+    let result = running
+        .await
+        .expect("skill task should join")
+        .expect("running skill should finish");
+    assert_eq!(result.status, SkillRunStatus::Ok);
+    assert_eq!(result.steps_completed, 2);
+    manager.shutdown().await.expect("fixture should stop");
+}
+
 struct FixtureRuntime {
     _root: TempDir,
     config_dir: std::path::PathBuf,
@@ -371,14 +587,27 @@ impl FixtureRuntime {
     }
 
     fn new_with_initialize_delay(initialize_delay_ms: u64) -> Self {
+        Self::new_with_options(initialize_delay_ms, false)
+    }
+
+    fn new_with_reconnect() -> Self {
+        Self::new_with_options(0, true)
+    }
+
+    fn new_with_options(initialize_delay_ms: u64, reconnect: bool) -> Self {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let config_dir = root.path().join("config");
         fs::create_dir(&config_dir).expect("config directory should be created");
         let startup_counter = root.path().join("starts.txt");
         let pid_file = root.path().join("pid.txt");
         let fixture_binary = env!("CARGO_BIN_EXE_mcp-host-fixture-server");
+        let reconnect = if reconnect {
+            "[reconnect]\nenabled = true\nmax_retries = 5\ninitial_backoff_ms = 20\nmax_backoff_ms = 20\njitter = false\n"
+        } else {
+            ""
+        };
         let manifest = format!(
-            "id = \"fixture\"\nname = \"Fixture\"\ndescription = \"Real RMCP fixture\"\n[transport]\ntype = \"stdio\"\ncommand = {fixture_binary:?}\nargs = [\"--startup-counter-file\", {startup_counter:?}, \"--pid-file\", {pid_file:?}, \"--initialize-delay-ms\", \"{initialize_delay_ms}\"]\n"
+            "id = \"fixture\"\nname = \"Fixture\"\ndescription = \"Real RMCP fixture\"\n{reconnect}[transport]\ntype = \"stdio\"\ncommand = {fixture_binary:?}\nargs = [\"--startup-counter-file\", {startup_counter:?}, \"--pid-file\", {pid_file:?}, \"--initialize-delay-ms\", \"{initialize_delay_ms}\"]\n"
         );
         fs::write(config_dir.join("fixture.toml"), manifest)
             .expect("fixture manifest should be written");
@@ -395,7 +624,14 @@ impl FixtureRuntime {
             .load_directory(&self.config_dir)
             .expect("fixture manifest should load");
         let registry = RegistryBuilder::build(loaded).expect("registry should build");
-        RuntimeManager::new(Arc::new(registry), RuntimeSettings::default())
+        let policy = Policy::load_optional(&self.config_dir).expect("policy should load");
+        let skills = SkillCatalog::load_directory(&self.config_dir).expect("skills should load");
+        RuntimeManager::new_with_configuration(
+            Arc::new(registry),
+            RuntimeSettings::default(),
+            policy,
+            skills,
+        )
     }
 
     fn startup_count(&self) -> u64 {
@@ -404,6 +640,23 @@ impl FixtureRuntime {
             .trim()
             .parse()
             .expect("startup counter should be numeric")
+    }
+
+    async fn wait_startup_count(&self, expected: u64) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fs::read_to_string(&self.startup_counter)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .is_some_and(|count| count >= expected)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture should restart before timeout");
     }
 
     fn pid(&self) -> u32 {

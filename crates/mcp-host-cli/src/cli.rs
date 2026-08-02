@@ -11,7 +11,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
     arg_required_else_help = true,
     about = "Run and control a shared Dynamic MCP Host",
     long_about = "Run and control a shared Dynamic MCP Host.\n\nThe daemon owns upstream MCP sessions. Ordinary CLI commands use the control endpoint, while `mcp-host mcp` is a transparent stdio bridge for AI clients. Connections to configured upstream servers are always explicit.",
-    after_long_help = "Examples:\n  mcp-host daemon run --config-dir ./config\n  mcp-host connect filesystem\n  mcp-host call filesystem read_file --arguments '{\"path\":\"README.md\"}'\n  mcp-host batch --calls '[{\"server_id\":\"filesystem\",\"tool_name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}]'\n  mcp-host harness install opencode\n  mcp-host harness install claude-code --scope user\n\nRun `mcp-host <command> --help` for command-specific details."
+    after_long_help = "Examples:\n  mcp-host daemon run --config-dir ./config\n  mcp-host connect filesystem\n  mcp-host auth login remote\n  mcp-host skill run issue-notify --input '{\"title\":\"Bug\"}'\n  mcp-host call filesystem read_file --arguments '{\"path\":\"README.md\"}'\n  mcp-host batch --calls '[{\"server_id\":\"filesystem\",\"tool_name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}]'\n  mcp-host harness install opencode\n  mcp-host harness install claude-code --scope user\n\nRun `mcp-host <command> --help` for command-specific details."
 )]
 pub struct Cli {
     /// Directory containing daemon lock, metadata, and IPC endpoints.
@@ -79,6 +79,12 @@ pub enum Command {
     Batch(Batch),
     /// Show daemon health and aggregate runtime state.
     Status,
+    /// Log in, inspect, or log out an OAuth-enabled HTTP server.
+    Auth(Auth),
+    /// List or run deterministic runtime skills.
+    Skill(Skill),
+    /// Explicitly install a downstream package declared by a server manifest.
+    Package(Package),
     /// Register the stdio bridge in a supported AI coding harness.
     Harness(Harness),
     /// Bridge stdin/stdout to the daemon's raw MCP endpoint.
@@ -86,6 +92,74 @@ pub enum Command {
         long_about = "Bridge stdin/stdout to the daemon's raw MCP endpoint.\n\nThis command is intended to be launched by an MCP client. The daemon must already be running. Stdout is reserved exclusively for MCP protocol bytes; diagnostics are written to stderr."
     )]
     Mcp,
+}
+
+#[derive(Debug, Args)]
+pub struct Auth {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Complete an authorization-code PKCE login through a loopback callback.
+    Login {
+        /// Registry ID whose HTTP manifest contains the auth section.
+        server_id: String,
+    },
+    /// Show secret-free OAuth status for a server.
+    Status {
+        /// Registry ID whose HTTP manifest contains the auth section.
+        server_id: String,
+    },
+    /// Disconnect the server and remove its locally stored OAuth credentials.
+    Logout {
+        /// Registry ID whose HTTP manifest contains the auth section.
+        server_id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct Skill {
+    #[command(subcommand)]
+    pub command: SkillCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// List runtime skills allowed by the current policy.
+    List,
+    /// Run one skill sequentially with JSON object inputs.
+    Run(SkillRun),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillRun {
+    /// Normalized runtime skill ID.
+    pub skill_id: String,
+
+    /// Skill inputs as an inline JSON object. Defaults to `{}`.
+    #[arg(long, value_name = "JSON", conflicts_with = "input_file")]
+    pub input: Option<String>,
+
+    /// Read the skill input JSON object from a file, or `-` for stdin.
+    #[arg(long, value_name = "PATH", conflicts_with = "input")]
+    pub input_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct Package {
+    #[command(subcommand)]
+    pub command: PackageCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PackageCommand {
+    /// Install or verify the exact npm, uv, or cargo package for a server.
+    Install {
+        /// Registry ID whose manifest contains the provision section.
+        server_id: String,
+    },
 }
 
 /// Commands that manage the local daemon.
@@ -104,6 +178,72 @@ pub enum DaemonCommand {
     Status,
     /// Request an orderly daemon shutdown.
     Stop,
+    /// Install, remove, or inspect an operating-system service descriptor.
+    Service(DaemonService),
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ServiceRun(DaemonServiceRun),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Args)]
+pub struct DaemonServiceRun {
+    #[arg(long, value_name = "DIR")]
+    pub config_dir: PathBuf,
+    #[arg(long)]
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonService {
+    #[command(subcommand)]
+    pub command: ServiceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    Install(ServiceInstall),
+    Uninstall(ServiceOptions),
+    Status(ServiceOptions),
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceInstall {
+    #[command(flatten)]
+    pub options: ServiceOptions,
+    /// Install and enable the service without starting it now.
+    #[arg(long)]
+    pub no_start: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ServiceOptions {
+    /// Directory containing server manifests and policy.toml.
+    #[arg(long, value_name = "DIR")]
+    pub config_dir: PathBuf,
+    /// Service manager; auto selects the native manager.
+    #[arg(long, value_enum, default_value_t = ServiceManager::Auto)]
+    pub manager: ServiceManager,
+    /// Install a per-user or system service.
+    #[arg(long, value_enum)]
+    pub scope: Option<ServiceScope>,
+    /// Stable service name.
+    #[arg(long, default_value = "dynamic-mcp")]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServiceManager {
+    Auto,
+    Systemd,
+    Launchd,
+    WindowsScm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ServiceScope {
+    User,
+    System,
 }
 
 /// Arguments used to start the daemon.
@@ -159,8 +299,8 @@ pub struct Harness {
 pub enum HarnessCommand {
     /// Register this binary's MCP bridge in one or more harnesses.
     #[command(
-        long_about = "Register this binary's MCP bridge in one or more harnesses.\n\nThe command invokes the selected harness's official CLI and stores the canonical absolute path of the current mcp-host executable. OpenCode uses its global configuration. Claude Code defaults to user scope so the host is available in every project. The daemon is not started by this command.",
-        after_long_help = "Examples:\n  mcp-host harness install opencode\n  mcp-host harness install claude-code\n  mcp-host harness install claude-code --scope project\n  mcp-host harness install all --name dynamic-mcp\n  mcp-host --runtime-dir /tmp/mcp-host harness install all"
+        long_about = "Register this binary's MCP bridge in one or more harnesses.\n\nBy default, the command stores the canonical absolute path of the current mcp-host executable followed by optional runtime arguments and `mcp`. A custom supervisor or daemon-bootstrap wrapper may be registered with --bridge-command and repeated --bridge-arg values. OpenCode uses its global configuration. Claude Code defaults to user scope so the host is available in every project. The daemon is not started by this command.",
+        after_long_help = "Examples:\n  mcp-host harness install opencode\n  mcp-host harness install claude-code\n  mcp-host harness install claude-code --scope project\n  mcp-host harness install all --name dynamic-mcp\n  mcp-host --runtime-dir /tmp/mcp-host harness install all\n  mcp-host harness install opencode --bridge-command ~/.local/libexec/mcp-host/serve-bridge"
     )]
     Install(HarnessInstall),
 }
@@ -179,6 +319,19 @@ pub struct HarnessInstall {
     /// Claude Code configuration scope. Ignored for OpenCode.
     #[arg(long, value_enum, default_value_t = ClaudeScope::User)]
     pub scope: ClaudeScope,
+
+    /// Register this executable instead of the current `mcp-host ... mcp` command.
+    #[arg(long, value_name = "PATH")]
+    pub bridge_command: Option<PathBuf>,
+
+    /// Append one argument to a custom bridge command. May be repeated.
+    #[arg(
+        long,
+        value_name = "ARG",
+        requires = "bridge_command",
+        allow_hyphen_values = true
+    )]
+    pub bridge_arg: Vec<String>,
 }
 
 /// Supported AI coding harnesses.
@@ -255,6 +408,22 @@ mod tests {
             &["mcp-host", "daemon", "run", "--config-dir", "config"],
             &["mcp-host", "daemon", "status"],
             &["mcp-host", "daemon", "stop"],
+            &[
+                "mcp-host",
+                "daemon",
+                "service",
+                "install",
+                "--config-dir",
+                "config",
+            ],
+            &[
+                "mcp-host",
+                "daemon",
+                "service",
+                "status",
+                "--config-dir",
+                "config",
+            ],
             &["mcp-host", "list"],
             &["mcp-host", "inspect", "server-a"],
             &["mcp-host", "connect", "server-a"],
@@ -276,6 +445,19 @@ mod tests {
                 "[{\"server_id\":\"server-a\",\"tool_name\":\"tool-a\"}]",
             ],
             &["mcp-host", "status"],
+            &["mcp-host", "auth", "login", "server-a"],
+            &["mcp-host", "auth", "status", "server-a"],
+            &["mcp-host", "auth", "logout", "server-a"],
+            &["mcp-host", "skill", "list"],
+            &[
+                "mcp-host",
+                "skill",
+                "run",
+                "issue-notify",
+                "--input",
+                "{\"title\":\"bug\"}",
+            ],
+            &["mcp-host", "package", "install", "server-a"],
             &["mcp-host", "harness", "install", "opencode"],
             &[
                 "mcp-host",
@@ -420,11 +602,83 @@ mod tests {
         assert_eq!(install.target, HarnessTarget::ClaudeCode);
         assert_eq!(install.name, "dynamic-mcp");
         assert_eq!(install.scope, ClaudeScope::User);
+        assert!(install.bridge_command.is_none());
+        assert!(install.bridge_arg.is_empty());
         assert!(
             Cli::try_parse_from([
                 "mcp-host", "harness", "install", "opencode", "--name", "bad name"
             ])
             .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mcp-host",
+                "harness",
+                "install",
+                "opencode",
+                "--bridge-arg",
+                "mcp"
+            ])
+            .is_err()
+        );
+
+        let custom = parse(&[
+            "mcp-host",
+            "harness",
+            "install",
+            "opencode",
+            "--bridge-command",
+            "/bin/true",
+            "--bridge-arg",
+            "--custom-flag",
+        ]);
+        let Command::Harness(Harness {
+            command: HarnessCommand::Install(custom),
+        }) = custom.command
+        else {
+            panic!("expected custom harness install command");
+        };
+        assert_eq!(custom.bridge_arg, ["--custom-flag"]);
+    }
+
+    #[test]
+    fn service_scope_is_manager_resolved_and_no_start_is_install_only() {
+        let parsed = Cli::try_parse_from([
+            "mcp-host",
+            "daemon",
+            "service",
+            "install",
+            "--config-dir",
+            "/tmp/config",
+            "--manager",
+            "windows-scm",
+            "--no-start",
+        ])
+        .expect("service install should parse");
+        let Command::Daemon(Daemon {
+            command:
+                DaemonCommand::Service(DaemonService {
+                    command: ServiceCommand::Install(install),
+                }),
+        }) = parsed.command
+        else {
+            panic!("expected service install");
+        };
+        assert_eq!(install.options.scope, None);
+        assert!(install.no_start);
+
+        assert!(
+            Cli::try_parse_from([
+                "mcp-host",
+                "daemon",
+                "service",
+                "status",
+                "--config-dir",
+                "/tmp/config",
+                "--no-start",
+            ])
+            .is_err(),
+            "--no-start must not be accepted by status"
         );
     }
 }

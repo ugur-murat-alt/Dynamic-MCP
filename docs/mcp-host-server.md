@@ -30,6 +30,8 @@ The advertised instructions are:
 4. Call list_tools after connecting to discover that server's available tools.
 5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.
 6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.
+7. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.
+8. For call_tool and successful call_tools items, also inspect the downstream isError field.
 ```
 
 ## Fixed Tool Surface
@@ -39,19 +41,33 @@ list.
 
 | Tool | Input summary | Output summary |
 | --- | --- | --- |
-| `list_servers` | No arguments. | Structured `{ "servers": ServerSummary[] }`, where each summary includes identity, public description, enabled state, transport, desired and observed state, tool count, and stale flag. |
-| `inspect_server` | `{ "server_id": string }` | Structured `ServerInspection`: secret-free public manifest, source path, transport and lifecycle state, protocol and upstream metadata, cached tool snapshot, safe error, PID, and connection timestamps. |
-| `connect_server` | `{ "server_id": string }` | Structured `ConnectResult`: server ID, lifecycle state, discovered tool count, protocol version, connection time, and tool snapshot. It initializes the downstream server and performs initial tool discovery. |
-| `disconnect_server` | `{ "server_id": string }` | Structured `DisconnectResult`: server ID, resulting lifecycle state, and disconnect time. It also cancels an in-progress startup when necessary. |
-| `list_tools` | `{ "server_id": string, "refresh": boolean }`; `refresh` defaults to `false`. | Structured `ToolSnapshot`: server ID, fetch time, count, tool definitions, and stale flag. Each tool definition includes input and optional output schemas plus optional metadata. |
-| `call_tool` | `{ "server_id": string, "tool_name": string, "arguments": object, "timeout_ms"?: integer }`. `arguments` is required and must be a JSON object. `timeout_ms`, when supplied, must be 1 through 300000 milliseconds and must not exceed the host limit. | The original downstream MCP `CallToolResult`, not a host wrapper. |
-| `call_tools` | `{ "calls": [{ "server_id": string, "tool_name": string, "arguments"?: object, "timeout_ms"?: integer }] }`, with 1 through 32 items. `arguments` defaults to `{}`; each server must already be connected. | `structuredContent.results`; each item is a `success` result or an `error` with `RuntimeError`, in input order. |
-| `status` | No arguments. | Structured `HostStatus`: daemon and protocol versions, start time and uptime, registry, connected, failed, and active-session counts, listener readiness, and shutdown state. |
-| `refresh_server` | `{ "server_id": string }` | Structured `ToolSnapshot` fetched again from the connected downstream server. |
+| `list_servers` | No arguments. | Envelope `data.servers` contains `ServerSummary[]`: identity, public description, enabled state, transport, desired and observed state, tool count, and stale flag. |
+| `inspect_server` | `{ "server_id": string }` | Envelope `data` is `ServerInspection`: secret-free public manifest, source path, transport and lifecycle state, protocol and upstream metadata, cached tool snapshot, safe error, PID, and connection timestamps. |
+| `connect_server` | `{ "server_id": string }` | Envelope `data` is `ConnectResult`: server ID, lifecycle state, discovered tool count, protocol version, connection time, and tool snapshot. It initializes the downstream server and performs initial tool discovery. |
+| `disconnect_server` | `{ "server_id": string }` | Envelope `data` is `DisconnectResult`: server ID, resulting lifecycle state, and disconnect time. It also cancels an in-progress startup when necessary. |
+| `list_tools` | `{ "server_id": string, "refresh": boolean }`; `refresh` defaults to `false`. | Envelope `data` is `ToolSnapshot`: server ID, fetch time, count, tool definitions, and stale flag. Each definition includes input and optional output schemas plus optional metadata. |
+| `call_tool` | `{ "server_id": string, "tool_name": string, "arguments": object, "timeout_ms"?: integer }`. `arguments` is required and must be a JSON object. `timeout_ms`, when supplied, must be 1 through 300000 milliseconds and must not exceed the host limit. | Preserves downstream top-level `content`, `isError`, and `_meta`; envelope `data.result` contains the complete raw downstream result. |
+| `call_tools` | `{ "calls": [{ "server_id": string, "tool_name": string, "arguments"?: object, "timeout_ms"?: integer }] }`, with 1 through 32 items. `arguments` defaults to `{}`; each server must already be connected. | Envelope `data.results` contains each `success` result or safe runtime `error`, in input order. |
+| `status` | No arguments. | Envelope `data` is `HostStatus`: daemon and protocol versions, start time and uptime, registry, connected, failed, and active-session counts, listener readiness, and shutdown state. |
+| `refresh_server` | `{ "server_id": string }` | Envelope `data` is a `ToolSnapshot` fetched again from the connected downstream server. |
 
-All host-produced structured outputs contain both a short human-readable text
-content block and `structuredContent`. The downstream result from `call_tool`
-is the exception because it is passed through as an MCP result.
+All nine tools advertise the same stable output schema. Successful
+`structuredContent` has this outer shape:
+
+```json
+{
+  "schema_version": "dynamic-mcp/v1",
+  "operation": "list_servers",
+  "ok": true,
+  "data": {}
+}
+```
+
+Host-produced operations also contain a short human-readable text content
+block. `call_tool` instead preserves downstream text/image/resource content,
+top-level `isError`, and `_meta`, while replacing only `structuredContent` with
+the Host envelope. The original structured content remains under
+`data.result.structuredContent`.
 
 `call_tools` runs items in parallel but preserves input order. Each successful
 item preserves the original downstream `content`, `structuredContent`,
@@ -64,9 +80,11 @@ other calls.
 
 `call_tool` serializes the downstream `CallToolResult` at the runtime boundary
 and decodes that same value for the inbound response. This preserves upstream
-content, `structuredContent`, `_meta`, and `isError`. In particular, an
-upstream tool-level error remains a valid MCP result with `isError: true`; it is
-not converted into a host protocol error.
+content, `_meta`, and `isError`; the complete raw value, including original
+`structuredContent`, is nested in the envelope. In particular, an upstream
+tool-level error remains a valid MCP result with `isError: true`; it is not
+converted into a host protocol error. Envelope `ok: true` means routing and
+transport completed, not that the downstream tool reported success.
 
 Host runtime failures are converted to MCP `ErrorData` safely:
 
@@ -74,10 +92,10 @@ Host runtime failures are converted to MCP `ErrorData` safely:
   `SERVER_DISABLED`, `SERVER_NOT_CONNECTED`, `TOOL_NOT_FOUND`, and
   `TOOLS_NOT_DISCOVERED`) become `invalid_params` errors.
 - Other runtime failures become internal errors.
-- The `ErrorData` payload contains the serialized safe `RuntimeError` only
-  when serialization succeeds. That DTO contains code, operation, optional
-  server ID, message, retryability, and optional source summary; it does not
-  contain tool arguments.
+- The `ErrorData` payload uses the same `dynamic-mcp/v1` outer fields with
+  `ok: false`; `data.error` contains stable code, operation, optional server ID,
+  and retryability. It does not contain tool arguments, source text, or raw
+  error messages.
 - If safe error serialization fails, the host returns the generic internal
   error `internal error` with no data rather than exposing an unsafe fallback.
 

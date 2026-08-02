@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
@@ -9,11 +9,19 @@ use url::Url;
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerManifest {
+    #[serde(default = "current_manifest_version")]
+    pub manifest_version: u32,
     pub id: String,
     pub name: String,
     pub description: String,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
+    #[serde(default)]
+    pub reconnect: ReconnectConfig,
+    #[serde(default)]
+    pub provision: Option<ProvisionConfig>,
+    #[serde(default)]
+    pub auth: Option<OAuthConfig>,
     pub transport: TransportConfig,
 }
 
@@ -21,12 +29,80 @@ impl fmt::Debug for ServerManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ServerManifest")
+            .field("manifest_version", &self.manifest_version)
             .field("id", &self.id)
             .field("name", &self.name)
             .field("description", &self.description)
             .field("enabled", &self.enabled)
+            .field("reconnect", &self.reconnect)
+            .field("provision", &self.provision)
+            .field("auth", &self.auth)
             .field("transport", &self.transport)
             .finish()
+    }
+}
+
+/// OAuth authorization-code PKCE settings for an HTTP server.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OAuthConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// Explicit package installation settings for a stdio server.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionConfig {
+    pub provider: PackageProvider,
+    pub package: String,
+    pub version: String,
+    pub binary: String,
+    #[serde(default)]
+    pub allow_scripts: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageProvider {
+    Npm,
+    Uv,
+    Cargo,
+}
+
+impl PackageProvider {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Uv => "uv",
+            Self::Cargo => "cargo",
+        }
+    }
+}
+
+/// Automatic recovery settings for an unexpectedly closed downstream transport.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReconnectConfig {
+    pub enabled: bool,
+    pub max_retries: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub jitter: bool,
+}
+
+impl Default for ReconnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_retries: 5,
+            initial_backoff_ms: 500,
+            max_backoff_ms: 30_000,
+            jitter: true,
+        }
     }
 }
 
@@ -76,6 +152,10 @@ impl fmt::Debug for TransportConfig {
 
 const fn enabled_by_default() -> bool {
     true
+}
+
+const fn current_manifest_version() -> u32 {
+    1
 }
 
 /// A normalized, validated server identifier.
@@ -164,10 +244,14 @@ impl fmt::Debug for SecretValue {
 /// A validated manifest with all environment references resolved.
 #[derive(Clone)]
 pub struct ResolvedServerManifest {
+    pub manifest_version: u32,
     pub id: ServerId,
     pub name: String,
     pub description: String,
     pub enabled: bool,
+    pub reconnect: ReconnectConfig,
+    pub provision: Option<ProvisionConfig>,
+    pub auth: Option<OAuthConfig>,
     pub transport: ResolvedTransportConfig,
 }
 
@@ -175,10 +259,14 @@ impl fmt::Debug for ResolvedServerManifest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ResolvedServerManifest")
+            .field("manifest_version", &self.manifest_version)
             .field("id", &self.id)
             .field("name", &self.name)
             .field("description", &self.description)
             .field("enabled", &self.enabled)
+            .field("reconnect", &self.reconnect)
+            .field("provision", &self.provision)
+            .field("auth", &self.auth)
             .field("transport", &self.transport)
             .finish()
     }
@@ -251,7 +339,9 @@ mod tests {
         )
         .expect("stdio manifest should parse");
 
+        assert_eq!(manifest.manifest_version, 1);
         assert!(manifest.enabled);
+        assert!(!manifest.reconnect.enabled);
         let TransportConfig::Stdio {
             args, environment, ..
         } = manifest.transport
@@ -260,6 +350,64 @@ mod tests {
         };
         assert_eq!(args, ["stdio", "--verbose"]);
         assert_eq!(environment["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
+    }
+
+    #[test]
+    fn parses_explicit_reconnect_settings() {
+        let manifest: ServerManifest = toml::from_str(
+            r#"
+                manifest_version = 1
+                id = "server"
+                name = "Server"
+                description = "Reconnect fixture"
+
+                [reconnect]
+                enabled = true
+                max_retries = 7
+                initial_backoff_ms = 250
+                max_backoff_ms = 4000
+                jitter = false
+
+                [transport]
+                type = "stdio"
+                command = "server"
+            "#,
+        )
+        .expect("reconnect settings should parse");
+
+        assert!(manifest.reconnect.enabled);
+        assert_eq!(manifest.reconnect.max_retries, 7);
+        assert_eq!(manifest.reconnect.initial_backoff_ms, 250);
+        assert_eq!(manifest.reconnect.max_backoff_ms, 4_000);
+        assert!(!manifest.reconnect.jitter);
+    }
+
+    #[test]
+    fn parses_explicit_package_provisioning() {
+        let manifest: ServerManifest = toml::from_str(
+            r#"
+                id = "server"
+                name = "Server"
+                description = "Package fixture"
+
+                [provision]
+                provider = "npm"
+                package = "@example/mcp-server"
+                version = "1.2.3"
+                binary = "example-mcp"
+                allow_scripts = true
+
+                [transport]
+                type = "stdio"
+                command = "example-mcp"
+            "#,
+        )
+        .expect("package settings should parse");
+
+        let provision = manifest.provision.expect("provision should exist");
+        assert_eq!(provision.provider.as_str(), "npm");
+        assert_eq!(provision.version, "1.2.3");
+        assert!(provision.allow_scripts);
     }
 
     #[test]
@@ -282,6 +430,30 @@ mod tests {
         .expect("HTTP manifest should parse");
 
         assert!(!manifest.enabled);
+    }
+
+    #[test]
+    fn parses_http_oauth_configuration() {
+        let manifest: ServerManifest = toml::from_str(
+            r#"
+                id = "remote"
+                name = "Remote"
+                description = "OAuth MCP server"
+
+                [auth]
+                client_id = "registered-client"
+                scopes = ["read", "write"]
+
+                [transport]
+                type = "http"
+                url = "https://example.com/mcp"
+            "#,
+        )
+        .expect("OAuth manifest should parse");
+
+        let auth = manifest.auth.expect("OAuth configuration should exist");
+        assert_eq!(auth.client_id.as_deref(), Some("registered-client"));
+        assert_eq!(auth.scopes, ["read", "write"]);
     }
 
     #[test]

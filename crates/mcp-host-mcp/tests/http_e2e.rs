@@ -53,7 +53,7 @@ async fn real_streamable_http_initialize_headers_tools_call_and_disconnect() {
             || Ok(FixtureServer::default()),
             Default::default(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true)
                 .with_sse_keep_alive(None)
                 .with_cancellation_token(cancellation.child_token()),
@@ -146,7 +146,7 @@ async fn paginated_discovery_and_failed_refresh_preserve_the_stale_snapshot() {
             move || Ok(server_state.clone()),
             Default::default(),
             StreamableHttpServerConfig::default()
-                .with_stateful_mode(false)
+                .with_legacy_session_mode(false)
                 .with_json_response(true)
                 .with_sse_keep_alive(None)
                 .with_cancellation_token(cancellation.child_token()),
@@ -285,20 +285,16 @@ impl ServerHandler for PaginatedServer {
         }
         let schema = Arc::new(serde_json::Map::new());
         if request.and_then(|params| params.cursor).as_deref() == Some("second-page") {
-            Ok(ListToolsResult {
-                tools: vec![Tool::new("third", "Third", schema)],
-                next_cursor: None,
-                meta: None,
-            })
+            Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "third", "Third", schema,
+            )]))
         } else {
-            Ok(ListToolsResult {
-                tools: vec![
-                    Tool::new("first", "First", Arc::clone(&schema)),
-                    Tool::new("second", "Second", schema),
-                ],
-                next_cursor: Some("second-page".to_owned()),
-                meta: None,
-            })
+            let mut result = ListToolsResult::with_all_items(vec![
+                Tool::new("first", "First", Arc::clone(&schema)),
+                Tool::new("second", "Second", schema),
+            ]);
+            result.next_cursor = Some("second-page".to_owned());
+            Ok(result)
         }
     }
 }

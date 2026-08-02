@@ -6,14 +6,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use directories::ProjectDirs;
 use fs2::FileExt as _;
 use interprocess::local_socket::tokio::{Listener, Stream};
 use interprocess::local_socket::traits::tokio::Listener as _;
 use mcp_host_core::{
     CONTROL_PROTOCOL_VERSION, ControlRequest, ControlRequestEnvelope, ControlResponseEnvelope,
-    ManifestLoader, ProcessEnvironment, RegistryBuilder, RuntimeError, RuntimeErrorCode,
+    ManifestLoader, Policy, ProcessEnvironment, RegistryBuilder, RuntimeError, RuntimeErrorCode,
+    SkillCatalog,
 };
 use mcp_host_mcp::{HostMcpServer, HostRuntimeState, RuntimeManager, RuntimeSettings};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use rmcp::ServiceExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,6 +51,33 @@ pub struct DaemonMetadata {
 
 /// Runs the singleton local daemon until a signal or control shutdown request arrives.
 pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
+    run_daemon_inner(options, None, None).await
+}
+
+/// Runs the daemon with an optional platform service cancellation source.
+pub async fn run_daemon_with_shutdown(
+    options: DaemonOptions,
+    external_shutdown: Option<CancellationToken>,
+) -> Result<(), RuntimeError> {
+    run_daemon_inner(options, external_shutdown, None).await
+}
+
+#[cfg(any(windows, test))]
+pub(crate) async fn run_daemon_with_ready(
+    options: DaemonOptions,
+    external_shutdown: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), RuntimeError> {
+    run_daemon_inner(options, Some(external_shutdown), Some(ready)).await
+}
+
+async fn run_daemon_inner(
+    options: DaemonOptions,
+    external_shutdown: Option<CancellationToken>,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), RuntimeError> {
+    let cancellation = external_shutdown.unwrap_or_default();
+    let auth_root = oauth_data_dir();
     prepare_runtime_dir(&options.runtime_dir)?;
 
     let lock_path = options.runtime_dir.join("daemon.lock");
@@ -77,21 +107,23 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
         ));
     }
 
-    let registry = match ManifestLoader::new(ProcessEnvironment).load_directory(&options.config_dir)
-    {
-        Ok(manifests) => match RegistryBuilder::build(manifests) {
-            Ok(registry) => registry,
-            Err(_) => {
-                files.cleanup();
-                return Err(config_error("build_registry"));
-            }
-        },
-        Err(_) => {
+    let (registry, policy, skills) = match load_configuration(&options.config_dir) {
+        Ok(configuration) => configuration,
+        Err(error) => {
             files.cleanup();
-            return Err(config_error("load_manifests"));
+            return Err(error);
         }
     };
-    let runtime = RuntimeManager::new(Arc::new(registry), RuntimeSettings::default());
+    let runtime = RuntimeManager::new_with_configuration(
+        Arc::new(registry),
+        RuntimeSettings {
+            package_root: Some(options.runtime_dir.join("packages")),
+            auth_root,
+            ..RuntimeSettings::default()
+        },
+        policy,
+        skills,
+    );
     let state = Arc::new(HostRuntimeState::new());
 
     let control_listener = match files.endpoints.bind(EndpointKind::Control) {
@@ -119,7 +151,7 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
         control_protocol_version: CONTROL_PROTOCOL_VERSION,
         control_endpoint: files.endpoints.address(EndpointKind::Control).to_owned(),
         mcp_endpoint: files.endpoints.address(EndpointKind::Mcp).to_owned(),
-        config_dir: options.config_dir,
+        config_dir: options.config_dir.clone(),
         binary_version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     if let Err(error) = write_metadata(&files.metadata_path, &metadata) {
@@ -129,7 +161,19 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
         return Err(error);
     }
 
-    let cancellation = CancellationToken::new();
+    let (watcher, reload_task) = match spawn_config_watcher(
+        options.config_dir.clone(),
+        Arc::clone(&runtime),
+        cancellation.clone(),
+    ) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            drop(control_listener);
+            drop(mcp_listener);
+            files.cleanup();
+            return Err(error);
+        }
+    };
     state.set_control_ready(true);
     state.set_mcp_ready(true);
     let control_accept = tokio::spawn(control_accept_loop(
@@ -144,15 +188,20 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
         Arc::clone(&state),
         cancellation.clone(),
     ));
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     wait_for_shutdown_event(cancellation.clone()).await;
     state.set_control_ready(false);
     state.set_mcp_ready(false);
     state.set_shutting_down(true);
     cancellation.cancel();
+    drop(watcher);
 
     wait_for_accept_task(control_accept, "control_accept_shutdown").await;
     wait_for_accept_task(mcp_accept, "mcp_accept_shutdown").await;
+    wait_for_accept_task(reload_task, "config_reload_shutdown").await;
     let shutdown = timeout(SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
     files.cleanup();
 
@@ -169,6 +218,11 @@ pub async fn run_daemon(options: DaemonOptions) -> Result<(), RuntimeError> {
             "downstream server shutdown timed out",
         )),
     }
+}
+
+fn oauth_data_dir() -> Option<PathBuf> {
+    ProjectDirs::from("org", "mcp-host", "mcp-host")
+        .map(|directories| directories.data_local_dir().join("auth"))
 }
 
 struct DaemonFiles {
@@ -296,6 +350,9 @@ async fn handle_control_connection(
         .as_ref()
         .map_or("", |error| error.code.as_str());
     let response_bytes = serde_json::to_vec(&response).map_or(0, |value| value.len());
+    if is_shutdown {
+        cancellation.cancel();
+    }
     if write_json(&mut stream, &response).await.is_err() {
         tracing::debug!(operation = "control_write", code = "IPC_UNAVAILABLE");
         return;
@@ -309,9 +366,83 @@ async fn handle_control_connection(
         success,
         error_code
     );
-    if is_shutdown {
-        cancellation.cancel();
-    }
+}
+
+fn load_configuration(
+    config_dir: &Path,
+) -> Result<(mcp_host_core::McpServerRegistry, Policy, SkillCatalog), RuntimeError> {
+    let manifests = ManifestLoader::new(ProcessEnvironment)
+        .load_directory(config_dir)
+        .map_err(|_| config_error("load_manifests"))?;
+    let registry = RegistryBuilder::build(manifests).map_err(|_| config_error("build_registry"))?;
+    let policy = Policy::load_optional(config_dir).map_err(|_| config_error("load_policy"))?;
+    let skills =
+        SkillCatalog::load_directory(config_dir).map_err(|_| config_error("load_skills"))?;
+    skills
+        .validate_server_references(&registry)
+        .map_err(|_| config_error("validate_skills"))?;
+    Ok((registry, policy, skills))
+}
+
+fn spawn_config_watcher(
+    config_dir: PathBuf,
+    runtime: Arc<RuntimeManager>,
+    cancellation: CancellationToken,
+) -> Result<(RecommendedWatcher, JoinHandle<()>), RuntimeError> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |result| {
+        let _ = sender.send(result);
+    })
+    .map_err(|_| config_error("watch_config"))?;
+    watcher
+        .watch(&config_dir, RecursiveMode::NonRecursive)
+        .map_err(|_| config_error("watch_config"))?;
+
+    let task = tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                event = receiver.recv() => event,
+            };
+            let Some(event) = event else {
+                return;
+            };
+            if event.is_err() {
+                tracing::warn!(operation = "config_watch", code = "PROTOCOL_ERROR");
+                continue;
+            }
+
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            while receiver.try_recv().is_ok() {}
+
+            match load_configuration(&config_dir) {
+                Ok((registry, policy, skills)) => {
+                    let result = runtime
+                        .reload_configuration(Arc::new(registry), policy, skills)
+                        .await;
+                    tracing::info!(
+                        operation = "config_reload",
+                        generation = result.generation,
+                        added = result.added,
+                        removed = result.removed,
+                        changed = result.changed,
+                        policy_changed = result.policy_changed,
+                        skills_changed = result.skills_changed,
+                        success = true
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    operation = "config_reload",
+                    code = error.code.as_str(),
+                    success = false
+                ),
+            }
+        }
+    });
+    Ok((watcher, task))
 }
 
 async fn serve_mcp_session(
@@ -373,6 +504,34 @@ async fn dispatch_request(
         ControlRequest::RefreshServer { server_id } => {
             json_value("refresh_server", runtime.refresh_server(&server_id).await?)
         }
+        ControlRequest::PackageInstall { server_id } => json_value(
+            "package_install",
+            runtime.package_install(&server_id).await?,
+        ),
+        ControlRequest::AuthStart {
+            server_id,
+            redirect_uri,
+        } => json_value(
+            "auth_start",
+            runtime.auth_start(&server_id, &redirect_uri).await?,
+        ),
+        ControlRequest::AuthComplete {
+            server_id,
+            callback_url,
+        } => json_value(
+            "auth_complete",
+            runtime.auth_complete(&server_id, &callback_url).await?,
+        ),
+        ControlRequest::AuthStatus { server_id } => {
+            json_value("auth_status", runtime.auth_status(&server_id).await?)
+        }
+        ControlRequest::AuthLogout { server_id } => {
+            json_value("auth_logout", runtime.auth_logout(&server_id).await?)
+        }
+        ControlRequest::SkillList => json_value("skill_list", runtime.list_skills().await),
+        ControlRequest::SkillRun { skill_id, inputs } => {
+            json_value("skill_run", runtime.run_skill(&skill_id, inputs).await?)
+        }
         ControlRequest::Shutdown => Ok(json!({ "accepted": true })),
     }
 }
@@ -396,6 +555,13 @@ fn control_operation(request: &ControlRequest) -> &'static str {
         ControlRequest::CallTool { .. } => "call_tool",
         ControlRequest::CallTools { .. } => "call_tools",
         ControlRequest::RefreshServer { .. } => "refresh_server",
+        ControlRequest::PackageInstall { .. } => "package_install",
+        ControlRequest::AuthStart { .. } => "auth_start",
+        ControlRequest::AuthComplete { .. } => "auth_complete",
+        ControlRequest::AuthStatus { .. } => "auth_status",
+        ControlRequest::AuthLogout { .. } => "auth_logout",
+        ControlRequest::SkillList => "skill_list",
+        ControlRequest::SkillRun { .. } => "skill_run",
         ControlRequest::Shutdown => "shutdown",
     }
 }
@@ -604,10 +770,12 @@ mod tests {
     };
     use mcp_host_mcp::{HostRuntimeState, RuntimeManager, RuntimeSettings};
     use serde_json::json;
+    use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        CONTROL_PROTOCOL_VERSION, ControlRequest, DaemonMetadata, RuntimeErrorCode,
-        allowed_during_shutdown, dispatch_request, protocol_mismatch_error,
+        CONTROL_PROTOCOL_VERSION, ControlRequest, DaemonMetadata, DaemonOptions, RuntimeErrorCode,
+        allowed_during_shutdown, dispatch_request, protocol_mismatch_error, run_daemon_with_ready,
     };
 
     #[test]
@@ -680,6 +848,29 @@ mod tests {
         let status = dispatch_request(&runtime, &state, ControlRequest::Status).await?;
         let status: HostStatus = serde_json::from_value(status)?;
         assert_eq!(status.registry_server_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn external_service_cancellation_stops_a_ready_daemon() -> Result<(), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let config_dir = root.path().join("config");
+        let runtime_dir = root.path().join("runtime");
+        std::fs::create_dir(&config_dir)?;
+        let cancellation = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(run_daemon_with_ready(
+            DaemonOptions {
+                config_dir,
+                runtime_dir,
+            },
+            cancellation.clone(),
+            ready_tx,
+        ));
+
+        timeout(Duration::from_secs(2), ready_rx).await??;
+        cancellation.cancel();
+        timeout(Duration::from_secs(2), daemon).await???;
         Ok(())
     }
 }

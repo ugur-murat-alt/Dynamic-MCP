@@ -13,15 +13,15 @@ them before the command for consistency.
 | --- | --- |
 | `--runtime-dir <DIR>` | Directory containing the daemon lock, metadata, and endpoint state. Defaults on Unix to `$XDG_RUNTIME_DIR/mcp-host` when `XDG_RUNTIME_DIR` is non-empty; otherwise it uses the platform local-data directory plus `runtime`. |
 | `--json` | Write successful command output as compact JSON. Without it, successful values are pretty-printed JSON. Runtime errors are JSON on stdout only with this flag, except for `mcp`. |
-| `--timeout <MS>` | Control request deadline in milliseconds, inclusive range `1..=300000`; default is 65 seconds. For `call`, the same optional value is also sent to the daemon as the downstream tool timeout. Batch control deadlines are derived from their items. |
+| `--timeout <MS>` | Control request deadline in milliseconds, inclusive range `1..=300000`; default is 65 seconds, except OAuth login waits up to 300 seconds. For `call`, the same optional value is also sent to the daemon as the downstream tool timeout. Batch control deadlines are derived from their items. |
 | `-h`, `--help` | Show Clap-generated help for the selected command. `--help` includes detailed examples where available. |
 | `-V`, `--version` | Show the binary version. |
 
-There is no implicit daemon startup or autostart. Every command other than
-`daemon run` and `harness install` requires the selected runtime directory's
-daemon endpoint to already be live. `mcp` also requires it, but uses its own
-fixed five-second connect deadline rather than `--timeout`. Harness child CLIs
-use a fixed 60-second deadline.
+There is no implicit daemon startup by normal control commands. Every command
+other than `daemon run`, `daemon service`, and `harness install` requires the
+selected runtime directory's daemon endpoint to already be live. `mcp` also
+requires it, but uses its own fixed five-second connect deadline rather than
+`--timeout`. Harness child CLIs use a fixed 60-second deadline.
 
 ## Commands
 
@@ -30,6 +30,9 @@ use a fixed 60-second deadline.
 | `daemon run --config-dir <DIR>` | Start the foreground daemon and load manifests from `<DIR>`. | `mcp-host --runtime-dir /run/user/1000/mcp-host daemon run --config-dir ./config` |
 | `daemon status` | Read daemon status. | `mcp-host --json daemon status` |
 | `daemon stop` | Request orderly daemon shutdown. | `mcp-host daemon stop` |
+| `daemon service install --config-dir <DIR> [--manager <...>] [--scope <...>] [--no-start]` | Install/repair, enable/load, and normally start the native service. | `mcp-host daemon service install --config-dir ./config` |
+| `daemon service uninstall --config-dir <DIR> [--manager <...>] [--scope <...>]` | Stop, disable/unload, and remove a managed native service. | `mcp-host daemon service uninstall --config-dir ./config` |
+| `daemon service status --config-dir <DIR> [--manager <...>] [--scope <...>]` | Read artifact ownership/drift plus loaded, enabled, and active state. | `mcp-host --json daemon service status --config-dir ./config` |
 | `list` | List configured servers. | `mcp-host list` |
 | `inspect <SERVER_ID>` | Inspect one server. | `mcp-host inspect filesystem` |
 | `connect <SERVER_ID>` | Connect one server. | `mcp-host connect filesystem` |
@@ -39,12 +42,84 @@ use a fixed 60-second deadline.
 | `call <SERVER_ID> <TOOL_NAME> [--arguments <JSON> | --arguments-file <PATH>]` | Invoke a tool. | `mcp-host call filesystem read_file --arguments '{"path":"README.md"}'` |
 | `batch --calls <JSON_ARRAY> | --calls-file <PATH\|->` | Invoke 1 through 32 already-connected tools in parallel. | `mcp-host batch --calls '[{"server_id":"fixture","tool_name":"echo"}]'` |
 | `status` | Read daemon status; equivalent control operation to `daemon status`. | `mcp-host status` |
+| `auth login <SERVER_ID>` | Start authorization-code PKCE and complete it through an ephemeral loopback callback. | `mcp-host auth login remote` |
+| `auth status <SERVER_ID>` | Show whether local OAuth credentials exist and list granted scopes without exposing tokens. | `mcp-host auth status remote` |
+| `auth logout <SERVER_ID>` | Disconnect the server and remove local OAuth credentials. | `mcp-host auth logout remote` |
+| `skill list` | List runtime skills allowed by `skill_run` policy. | `mcp-host skill list` |
+| `skill run <SKILL_ID> [--input <JSON> \| --input-file <PATH\|->]` | Run 1-16 tool steps sequentially and fail fast. | `mcp-host skill run issue-notify --input '{"title":"Bug"}'` |
+| `package install <SERVER_ID>` | Explicitly install the exact package declared by the manifest. | `mcp-host package install remote` |
 | `harness install <TARGET>` | Register the stdio bridge with `opencode`, `claude-code`, or `all`. | `mcp-host harness install all` |
 | `mcp` | Bridge stdin/stdout to the daemon's MCP endpoint. | `mcp-host mcp` |
 
-`--config-dir` belongs to `daemon run`; it is required and has no default.
+`--config-dir` belongs to `daemon run` and each `daemon service` subcommand; it
+is required and has no default.
 `--refresh` belongs only to `tools`. `call` requires the positional server ID
 and tool name. `--arguments` and `--arguments-file` are mutually exclusive.
+
+## Native Service Management
+
+`--manager auto` selects systemd on Linux, launchd on macOS, and native Windows
+SCM on Windows. Scope defaults to `user` for systemd/launchd and `system` for
+Windows SCM. Windows explicitly rejects user scope. All manager calls use exact
+argv without a shell.
+
+`install` enables and starts by default. `--no-start` still writes/enables a
+systemd or Windows service but does not start it; for launchd it writes the
+LaunchAgent/LaunchDaemon without bootstrapping it. A normal reinstall restarts a
+loaded service to guarantee current descriptor argv is active. `uninstall`
+checks ownership before any manager mutation, then stops/unloads and removes.
+
+Successful status JSON has this stable shape:
+
+```json
+{
+  "artifact": "installed",
+  "loaded": true,
+  "enabled": true,
+  "active": "running",
+  "descriptor": "/path/or/service-name"
+}
+```
+
+`artifact` is `not_installed`, `installed`, `drifted`, or `foreign`; `active` is
+`running`, `stopped`, `failed`, or `unknown`. These states return exit status 0
+when the query itself succeeds. Manager absence, permission denial, and query
+failure return `SERVICE_MANAGER_UNAVAILABLE`, `SERVICE_PERMISSION_DENIED`, or
+`SERVICE_OPERATION_FAILED`; attempted mutation of a foreign service returns
+`SERVICE_FOREIGN`.
+
+Systemd user scope runs `systemctl --user`; Dynamic MCP does not modify linger
+settings. Launchd uses `gui/<uid>` for user agents and `system` for daemons.
+Windows uses an auto-start LocalSystem SCM service with a hidden native service
+dispatcher; STOP/SHUTDOWN controls trigger the daemon's normal bounded cleanup.
+
+## OAuth Login
+
+`auth login` opens a listener only on `127.0.0.1` with an OS-assigned port,
+asks the daemon to build the authorization URL, and prints that URL to stderr.
+Open it in a browser. The CLI accepts one matching `/callback` request, sends
+the complete callback URL to the daemon for PKCE/state/issuer validation and
+token exchange, then returns secret-free status JSON. Authorization and callback
+URLs are never included in runtime errors or daemon logs.
+
+Each accepted loopback connection has a five-second request-header deadline;
+silent or malformed local connections receive an error response and do not
+consume the complete login attempt.
+
+The daemon must remain running for the whole login. A login expires after five
+minutes, a second simultaneous login is rejected, and login is rejected while
+that server is connected. `auth logout` disconnects first so an in-flight token
+refresh cannot recreate a deleted credential file.
+
+## Runtime Skills
+
+`skill list` and `skill run` are control-plane commands; they do not expand the
+fixed Host MCP tool list. Input defaults to `{}` and must be a JSON object.
+`--input-file -` reads stdin. Successful and failed step runs both print the
+structured result so completed-step outputs remain available. CLI status is `5`
+when a downstream step returns `isError: true`, `4` for another failed step, and
+`0` when every step succeeds. See [Runtime Skills](runtime-skills.md) for the
+TOML, template, policy, reload, and output contracts.
 
 ## Batch Calls
 
@@ -92,6 +167,10 @@ mcp-host harness install claude-code --scope project
 
 # Configure both harnesses
 mcp-host harness install all --name dynamic-mcp
+
+# Register a daemon-bootstrap or supervisor wrapper as the complete command
+mcp-host harness install opencode \
+  --bridge-command ~/.local/libexec/mcp-host/serve-bridge
 ```
 
 | Option | Meaning |
@@ -100,18 +179,31 @@ mcp-host harness install all --name dynamic-mcp
 | `--name <NAME>` | Stored MCP server name. Default: `dynamic-mcp`. Names accept 1-64 ASCII letters, digits, hyphens, underscores, or dots. |
 | `--scope <SCOPE>` | Claude Code scope: `local`, `project`, or `user`. Default: `user`. Ignored for OpenCode. |
 | `--runtime-dir <DIR>` | Store an absolute runtime override in the registered bridge command. Relative input is resolved from the installation command's working directory. Omit it to use the platform default. |
+| `--bridge-command <PATH>` | Register this canonicalized executable as the complete bridge command instead of the current `mcp-host ... mcp` argv. It cannot be combined with `--runtime-dir`. |
+| `--bridge-arg <ARG>` | Append one argument to `--bridge-command`; repeat for multiple arguments. No implicit `mcp` argument is added. |
 
-OpenCode 1.18.4 writes MCP registrations globally and replaces an existing
-entry with the same name. Claude Code 2.1.218 rejects duplicate names, so
-`mcp-host` removes and recreates only the selected Claude scope. This makes the
-command repeatable, but an existing same-name registration in that scope is
-intentionally replaced. Claude's `local` scope has higher precedence than
-`project`, which has higher precedence than `user`; a same-name higher-scope
-entry can therefore mask a newly installed user entry.
+OpenCode writes MCP registrations globally. Claude Code rejects duplicate
+names, so a mismatched Claude registration is removed and recreated only in the
+selected scope. Before invoking either CLI, `mcp-host` semantically checks the
+resolved config; an exact name, transport, command, and argv match is not
+rewritten. OpenCode verification follows the runtime's deep merge order:
+`config.json`, `opencode.json`, then `opencode.jsonc`. After an update it reads
+the effective OpenCode or Claude scope back and rejects a false-success CLI exit.
+Claude's `local` scope has higher
+precedence than `project`, which has higher precedence than `user`; a same-name
+higher-scope entry can therefore mask a newly installed user entry.
 
-The selected harness CLI must already be on `PATH`. Harness configuration does
-not start the daemon. Successful JSON output contains the installed harnesses,
-the exact bridge argv, and `"daemonRequired": true`.
+Each concrete harness also receives the embedded `dynamic-mcp` skill and a
+marked instruction block. OpenCode uses `$XDG_CONFIG_HOME/opencode` on every
+platform, falling back to `~/.config/opencode`; Claude Code uses
+`~/.claude/skills/dynamic-mcp/SKILL.md` and `~/.claude/CLAUDE.md`. Existing text
+outside `<!-- dynamic-mcp:start -->` and `<!-- dynamic-mcp:end -->` is preserved.
+Skill and instruction files are content-idempotent and atomically replaced.
+
+The selected harness CLI must be on `PATH` only when a registration needs to be
+created or repaired. Harness configuration does not start the daemon. Successful
+JSON output contains the installed harnesses, exact bridge argv, verification
+and update flags, config/skill/instruction paths, and `"daemonRequired": true`.
 
 ## Tool Arguments
 

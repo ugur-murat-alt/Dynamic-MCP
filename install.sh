@@ -14,7 +14,7 @@ Usage:
   install.sh [--version <TAG>] [--install-dir <DIR>] [--repo <OWNER/REPO>]
 
 Options:
-  --version <TAG>      Release tag to install, for example v0.1.0. Default: latest.
+  --version <TAG>      Release tag to install, for example v0.2.0. Default: latest.
   --install-dir <DIR>  Destination directory. Default: $HOME/.local/bin.
   --repo <OWNER/REPO>  GitHub repository. Default: ugur-murat-alt/Dynamic-MCP.
   -h, --help           Show this help.
@@ -25,7 +25,7 @@ Environment:
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh -s -- --version v0.1.0
+  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh -s -- --version v0.2.0
 EOF
 }
 

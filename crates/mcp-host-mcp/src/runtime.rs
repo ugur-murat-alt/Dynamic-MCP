@@ -5,7 +5,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -13,17 +13,26 @@ use std::{
 use futures_util::future::join_all;
 use http::{HeaderName, HeaderValue};
 use mcp_host_core::{
-    BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult,
-    ConnectDisposition, ConnectResult, DesiredConnection, DisconnectDisposition, DisconnectResult,
-    Lifecycle, LifecycleState, MAX_BATCH_CALLS, McpServerRegistry, RegisteredServer,
-    ResolvedTransportConfig, RuntimeError, RuntimeErrorCode, ServerId, ServerInspection,
-    ServerSummary, ToolCallResult, ToolDefinition, ToolSnapshot, TransportKind,
+    AuthLoginStartResult, AuthStatusResult, BatchToolCall, BatchToolCallOutcome,
+    BatchToolCallResponse, BatchToolCallResult, ConnectDisposition, ConnectResult,
+    DesiredConnection, DisconnectDisposition, DisconnectResult, Lifecycle, LifecycleState,
+    MAX_BATCH_CALLS, McpServerRegistry, PackageInstallResult, Policy, PolicyAction, PolicyDecision,
+    ReconnectConfig, RegisteredServer, ResolvedTransportConfig, RuntimeError, RuntimeErrorCode,
+    ServerId, ServerInspection, ServerSummary, SkillCatalog, SkillRunResult, SkillRunStatus,
+    SkillSummary, ToolCallResult, ToolDefinition, ToolSnapshot, TransportKind,
 };
+use process_wrap::tokio::CommandWrap;
+#[cfg(windows)]
+use process_wrap::tokio::JobObject;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use rmcp::transport::auth::AuthClient;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{
     ClientHandler, Peer, ServiceError, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, ClientRequest, ServerInfo, ServerResult, Tool,
+        CallToolRequest, CallToolRequestParams, ClientInfo, ClientRequest, ProtocolVersion,
+        ServerInfo, ServerResult, Tool,
     },
     service::{PeerRequestOptions, RoleClient, RunningService},
     transport::{StreamableHttpClientTransport, TokioChildProcess},
@@ -31,11 +40,13 @@ use rmcp::{
 use serde_json::{Value, json};
 use tokio::{
     io::AsyncReadExt,
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, RwLock},
     task::JoinHandle,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+
+use crate::{auth::ServerAuth, package::PackageInstaller, skill::SkillEngine};
 
 static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -52,6 +63,10 @@ pub struct RuntimeSettings {
     pub max_request_timeout: Duration,
     /// Number of latest stderr bytes retained for internal diagnostics.
     pub stderr_tail_bytes: usize,
+    /// Root directory for explicit downstream package installations.
+    pub package_root: Option<std::path::PathBuf>,
+    /// Root directory for persistent OAuth credentials.
+    pub auth_root: Option<std::path::PathBuf>,
 }
 
 impl Default for RuntimeSettings {
@@ -62,54 +77,250 @@ impl Default for RuntimeSettings {
             shutdown_grace: Duration::from_secs(4),
             max_request_timeout: Duration::from_secs(300),
             stderr_tail_bytes: 8_192,
+            package_root: None,
+            auth_root: None,
         }
     }
 }
 
-/// Owns the independent runtimes associated with one immutable registry snapshot.
+/// Result of atomically reconciling a newly loaded registry snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryReloadResult {
+    pub generation: u64,
+    pub added: u64,
+    pub removed: u64,
+    pub changed: u64,
+    pub policy_changed: bool,
+    pub skills_changed: bool,
+}
+
+/// Owns the independent runtimes associated with the current registry snapshot.
 pub struct RuntimeManager {
+    catalog: RwLock<RuntimeCatalog>,
+    settings: RuntimeSettings,
+    generation: AtomicU64,
+    server_count: AtomicU64,
+    shutdown: CancellationToken,
+    package_installer: Option<PackageInstaller>,
+}
+
+struct RuntimeCatalog {
     registry: Arc<McpServerRegistry>,
     servers: BTreeMap<String, Arc<ServerRuntime>>,
+    policy: Arc<Policy>,
+    skills: Arc<SkillCatalog>,
 }
 
 impl RuntimeManager {
     /// Creates one runtime state machine per registered server.
     #[must_use]
     pub fn new(registry: Arc<McpServerRegistry>, settings: RuntimeSettings) -> Arc<Self> {
-        let servers = registry
+        Self::new_with_configuration(
+            registry,
+            settings,
+            Policy::default(),
+            SkillCatalog::default(),
+        )
+    }
+
+    /// Creates runtime state machines with an explicit global policy snapshot.
+    #[must_use]
+    pub fn new_with_policy(
+        registry: Arc<McpServerRegistry>,
+        settings: RuntimeSettings,
+        policy: Policy,
+    ) -> Arc<Self> {
+        Self::new_with_configuration(registry, settings, policy, SkillCatalog::default())
+    }
+
+    /// Creates runtime state machines with explicit policy and skill snapshots.
+    #[must_use]
+    pub fn new_with_configuration(
+        registry: Arc<McpServerRegistry>,
+        settings: RuntimeSettings,
+        policy: Policy,
+        skills: SkillCatalog,
+    ) -> Arc<Self> {
+        let shutdown = CancellationToken::new();
+        let package_installer = settings.package_root.clone().map(PackageInstaller::new);
+        let servers: BTreeMap<String, Arc<ServerRuntime>> = registry
             .iter()
             .map(|server| {
                 let id = server.id().as_str().to_owned();
                 (
                     id.clone(),
-                    Arc::new(ServerRuntime::new(id, server.clone(), settings.clone())),
+                    Arc::new(ServerRuntime::new(
+                        id,
+                        server.clone(),
+                        settings.clone(),
+                        shutdown.clone(),
+                    )),
                 )
             })
             .collect();
-        Arc::new(Self { registry, servers })
+        let server_count = servers.len() as u64;
+        Arc::new(Self {
+            catalog: RwLock::new(RuntimeCatalog {
+                registry,
+                servers,
+                policy: Arc::new(policy),
+                skills: Arc::new(skills),
+            }),
+            settings,
+            generation: AtomicU64::new(1),
+            server_count: AtomicU64::new(server_count),
+            shutdown,
+            package_installer,
+        })
     }
 
-    /// Returns the immutable registry used by this manager.
+    /// Returns the current immutable registry snapshot.
+    pub async fn registry(&self) -> Arc<McpServerRegistry> {
+        Arc::clone(&self.catalog.read().await.registry)
+    }
+
+    /// Returns the current registry generation.
     #[must_use]
-    pub fn registry(&self) -> Arc<McpServerRegistry> {
-        Arc::clone(&self.registry)
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Atomically publishes and reconciles a fully validated registry snapshot.
+    pub async fn reload_registry(
+        self: &Arc<Self>,
+        registry: Arc<McpServerRegistry>,
+    ) -> RegistryReloadResult {
+        let (policy, skills) = {
+            let catalog = self.catalog.read().await;
+            (Arc::clone(&catalog.policy), Arc::clone(&catalog.skills))
+        };
+        self.reload_configuration(registry, policy.as_ref().clone(), skills.as_ref().clone())
+            .await
+    }
+
+    /// Atomically publishes registry and policy snapshots before reconciliation.
+    pub async fn reload_configuration(
+        self: &Arc<Self>,
+        registry: Arc<McpServerRegistry>,
+        policy: Policy,
+        skills: SkillCatalog,
+    ) -> RegistryReloadResult {
+        let mut retired = Vec::new();
+        let mut replaced = Vec::new();
+        let (added, removed, changed, policy_changed, skills_changed) = {
+            let mut catalog = self.catalog.write().await;
+            let policy_changed = catalog.policy.as_ref() != &policy;
+            let skills_changed = catalog.skills.as_ref() != &skills;
+            let mut previous = std::mem::take(&mut catalog.servers);
+            let mut next = BTreeMap::new();
+            let mut added = 0_u64;
+            let mut changed = 0_u64;
+
+            for server in registry.iter() {
+                let id = server.id().as_str().to_owned();
+                match previous.remove(&id) {
+                    Some(runtime) if runtime.registered.raw_manifest() == server.raw_manifest() => {
+                        next.insert(id, runtime);
+                    }
+                    Some(runtime) => {
+                        changed = changed.saturating_add(1);
+                        let replacement = Arc::new(ServerRuntime::new(
+                            id.clone(),
+                            server.clone(),
+                            self.settings.clone(),
+                            self.shutdown.clone(),
+                        ));
+                        replaced.push((runtime, Arc::clone(&replacement)));
+                        next.insert(id, replacement);
+                    }
+                    None => {
+                        added = added.saturating_add(1);
+                        next.insert(
+                            id.clone(),
+                            Arc::new(ServerRuntime::new(
+                                id,
+                                server.clone(),
+                                self.settings.clone(),
+                                self.shutdown.clone(),
+                            )),
+                        );
+                    }
+                }
+            }
+
+            let removed = previous.len() as u64;
+            retired.extend(previous.into_values());
+            if added == 0 && removed == 0 && changed == 0 && !policy_changed && !skills_changed {
+                catalog.registry = registry;
+                catalog.servers = next;
+                return RegistryReloadResult {
+                    generation: self.generation(),
+                    added,
+                    removed,
+                    changed,
+                    policy_changed,
+                    skills_changed,
+                };
+            }
+            catalog.registry = registry;
+            catalog.servers = next;
+            catalog.policy = Arc::new(policy);
+            catalog.skills = Arc::new(skills);
+            self.server_count
+                .store(catalog.servers.len() as u64, Ordering::Release);
+            (added, removed, changed, policy_changed, skills_changed)
+        };
+
+        for runtime in retired {
+            let _ = runtime.disconnect().await;
+        }
+        for (old, replacement) in replaced {
+            let reconnect = old.desired().await == DesiredConnection::Connected;
+            let _ = old.disconnect().await;
+            if reconnect && replacement.registered.enabled() {
+                let _ = replacement.connect().await;
+            }
+        }
+
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        RegistryReloadResult {
+            generation,
+            added,
+            removed,
+            changed,
+            policy_changed,
+            skills_changed,
+        }
     }
 
     /// Lists servers in normalized ID order.
     pub async fn list_servers(&self) -> Vec<ServerSummary> {
-        let futures = self.servers.values().map(|runtime| runtime.summary());
+        let servers = self.runtimes().await;
+        let policy = self.policy().await;
+        let futures = servers
+            .iter()
+            .filter(|runtime| {
+                policy.check(PolicyAction::List, &runtime.id, None) == PolicyDecision::Allow
+            })
+            .map(|runtime| runtime.summary());
         join_all(futures).await
     }
 
     /// Returns public, secret-free metadata and current runtime state for a server.
     pub async fn inspect_server(&self, server_id: &str) -> Result<ServerInspection, RuntimeError> {
-        self.server(server_id, "inspect_server")?.inspection().await
+        let runtime = self.server(server_id, "inspect_server").await?;
+        self.authorize(PolicyAction::Inspect, &runtime.id, None, "inspect_server")
+            .await?;
+        runtime.inspection().await
     }
 
     /// Connects, initializes, and discovers all tools for a server.
     pub async fn connect_server(&self, server_id: &str) -> Result<ConnectResult, RuntimeError> {
         let started = Instant::now();
-        let result = self.server(server_id, "connect_server")?.connect().await;
+        let runtime = self.server(server_id, "connect_server").await?;
+        self.authorize(PolicyAction::Connect, &runtime.id, None, "connect_server")
+            .await?;
+        let result = runtime.connect().await;
         trace_operation("connect_server", server_id, started, &result);
         result
     }
@@ -120,10 +331,15 @@ impl RuntimeManager {
         server_id: &str,
     ) -> Result<DisconnectResult, RuntimeError> {
         let started = Instant::now();
-        let result = self
-            .server(server_id, "disconnect_server")?
-            .disconnect()
-            .await;
+        let runtime = self.server(server_id, "disconnect_server").await?;
+        self.authorize(
+            PolicyAction::Disconnect,
+            &runtime.id,
+            None,
+            "disconnect_server",
+        )
+        .await?;
+        let result = runtime.disconnect().await;
         trace_operation("disconnect_server", server_id, started, &result);
         result
     }
@@ -134,7 +350,18 @@ impl RuntimeManager {
         server_id: &str,
         refresh: bool,
     ) -> Result<ToolSnapshot, RuntimeError> {
-        let runtime = self.server(server_id, "list_tools")?;
+        let runtime = self.server(server_id, "list_tools").await?;
+        self.authorize(
+            if refresh {
+                PolicyAction::Refresh
+            } else {
+                PolicyAction::List
+            },
+            &runtime.id,
+            None,
+            "list_tools",
+        )
+        .await?;
         if refresh {
             return runtime.refresh().await;
         }
@@ -144,7 +371,10 @@ impl RuntimeManager {
     /// Refreshes the discovered tool cache.
     pub async fn refresh_server(&self, server_id: &str) -> Result<ToolSnapshot, RuntimeError> {
         let started = Instant::now();
-        let result = self.server(server_id, "refresh_server")?.refresh().await;
+        let runtime = self.server(server_id, "refresh_server").await?;
+        self.authorize(PolicyAction::Refresh, &runtime.id, None, "refresh_server")
+            .await?;
+        let result = runtime.refresh().await;
         trace_operation("refresh_server", server_id, started, &result);
         result
     }
@@ -160,10 +390,15 @@ impl RuntimeManager {
         let started = Instant::now();
         let invocation_id = NEXT_INVOCATION_ID.fetch_add(1, Ordering::Relaxed);
         let argument_bytes = serde_json::to_vec(&arguments).map_or(0, |value| value.len());
-        let result = self
-            .server(server_id, "call_tool")?
-            .call_tool(tool_name, arguments, timeout_ms)
-            .await;
+        let runtime = self.server(server_id, "call_tool").await?;
+        self.authorize(
+            PolicyAction::Call,
+            &runtime.id,
+            Some(tool_name),
+            "call_tool",
+        )
+        .await?;
+        let result = runtime.call_tool(tool_name, arguments, timeout_ms).await;
         let result_bytes = result
             .as_ref()
             .ok()
@@ -225,9 +460,165 @@ impl RuntimeManager {
         Ok(BatchToolCallResponse { results })
     }
 
+    /// Lists runtime skills allowed by the current skill policy.
+    pub async fn list_skills(&self) -> Vec<SkillSummary> {
+        let catalog = self.catalog.read().await;
+        catalog
+            .skills
+            .iter()
+            .filter(|skill| catalog.policy.check_skill(skill.id()) == PolicyDecision::Allow)
+            .map(|skill| skill.summary())
+            .collect()
+    }
+
+    /// Runs one immutable skill snapshot sequentially and stops at its first failed step.
+    pub async fn run_skill(
+        &self,
+        skill_id: &str,
+        inputs: Value,
+    ) -> Result<SkillRunResult, RuntimeError> {
+        let started = Instant::now();
+        let input_bytes = serde_json::to_vec(&inputs).map_or(0, |encoded| encoded.len());
+        let normalized = ServerId::parse(skill_id)
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_else(|_| skill_id.to_owned());
+        let (skill, policy) = {
+            let catalog = self.catalog.read().await;
+            (catalog.skills.get(&normalized), Arc::clone(&catalog.policy))
+        };
+        let skill = skill.ok_or_else(|| {
+            RuntimeError::new(
+                RuntimeErrorCode::SkillNotFound,
+                "skill_run",
+                "the runtime skill is not registered",
+            )
+        })?;
+        if policy.check_skill(skill.id()) == PolicyDecision::Deny {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::PolicyDenied,
+                "skill_run",
+                "the skill is denied by policy",
+            ));
+        }
+
+        let result = SkillEngine::run(self, &skill, inputs).await;
+        let result_bytes = result
+            .as_ref()
+            .ok()
+            .and_then(|result| serde_json::to_vec(result).ok())
+            .map_or(0, |encoded| encoded.len());
+        let (success, error_code) = match &result {
+            Ok(result) if result.status == SkillRunStatus::Ok => (true, ""),
+            Ok(result) => (
+                false,
+                result
+                    .failure
+                    .as_ref()
+                    .map_or("", |failure| failure.error.code.as_str()),
+            ),
+            Err(error) => (false, error.code.as_str()),
+        };
+        tracing::info!(
+            operation = "skill_run",
+            skill_id = skill.id(),
+            input_bytes,
+            result_bytes,
+            duration_ms = duration_ms(started.elapsed()),
+            success,
+            error_code
+        );
+        result
+    }
+
+    /// Explicitly installs the package declared by a server manifest.
+    pub async fn package_install(
+        &self,
+        server_id: &str,
+    ) -> Result<PackageInstallResult, RuntimeError> {
+        let runtime = self.server(server_id, "package_install").await?;
+        self.authorize(
+            PolicyAction::PackageInstall,
+            &runtime.id,
+            None,
+            "package_install",
+        )
+        .await?;
+        let provision = runtime
+            .registered
+            .resolved_manifest()
+            .provision
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::for_server(
+                    RuntimeErrorCode::PackageNotConfigured,
+                    "package_install",
+                    &runtime.id,
+                    "the server manifest has no package configuration",
+                )
+            })?;
+        let installer = self.package_installer.as_ref().ok_or_else(|| {
+            RuntimeError::for_server(
+                RuntimeErrorCode::PackageInstallFailed,
+                "package_install",
+                &runtime.id,
+                "the package cache is unavailable",
+            )
+        })?;
+        installer.install(&runtime.id, provision).await
+    }
+
+    /// Starts an OAuth authorization-code PKCE flow for an HTTP server.
+    pub async fn auth_start(
+        &self,
+        server_id: &str,
+        redirect_uri: &str,
+    ) -> Result<AuthLoginStartResult, RuntimeError> {
+        let runtime = self.server(server_id, "auth_start").await?;
+        self.authorize(PolicyAction::AuthStart, &runtime.id, None, "auth_start")
+            .await?;
+        runtime.auth_start(redirect_uri).await
+    }
+
+    /// Completes an in-progress OAuth flow with the loopback callback URL.
+    pub async fn auth_complete(
+        &self,
+        server_id: &str,
+        callback_url: &str,
+    ) -> Result<AuthStatusResult, RuntimeError> {
+        let runtime = self.server(server_id, "auth_complete").await?;
+        self.authorize(PolicyAction::AuthStart, &runtime.id, None, "auth_complete")
+            .await?;
+        runtime.oauth("auth_complete")?.complete(callback_url).await
+    }
+
+    /// Returns secret-free OAuth status for one server.
+    pub async fn auth_status(&self, server_id: &str) -> Result<AuthStatusResult, RuntimeError> {
+        let runtime = self.server(server_id, "auth_status").await?;
+        self.authorize(PolicyAction::Inspect, &runtime.id, None, "auth_status")
+            .await?;
+        runtime.oauth("auth_status")?.status().await
+    }
+
+    /// Disconnects a server and clears its locally stored OAuth credentials.
+    pub async fn auth_logout(&self, server_id: &str) -> Result<AuthStatusResult, RuntimeError> {
+        let runtime = self.server(server_id, "auth_logout").await?;
+        self.authorize(PolicyAction::AuthLogout, &runtime.id, None, "auth_logout")
+            .await?;
+        let auth = runtime.oauth("auth_logout")?;
+        let _logout = runtime.begin_auth_logout()?;
+        runtime.disconnect().await?;
+        auth.logout().await
+    }
+
     /// Gracefully disconnects all registered servers concurrently.
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
-        let results = join_all(self.servers.values().map(|runtime| runtime.disconnect())).await;
+        self.shutdown.cancel();
+        let servers = self.runtimes().await;
+        for runtime in &servers {
+            runtime.cancel_recovery().await;
+        }
+        let results = join_all(servers.iter().map(|runtime| runtime.disconnect())).await;
+        join_all(servers.iter().map(|runtime| runtime.wait_for_recovery())).await;
         if let Some(error) = results.into_iter().find_map(Result::err) {
             return Err(RuntimeError::new(
                 RuntimeErrorCode::ShutdownFailed,
@@ -242,12 +633,13 @@ impl RuntimeManager {
     /// Returns the number of registered servers.
     #[must_use]
     pub fn server_count(&self) -> u64 {
-        self.registry.len() as u64
+        self.server_count.load(Ordering::Acquire)
     }
 
     /// Returns the number of currently connected servers.
     pub async fn connected_count(&self) -> u64 {
-        join_all(self.servers.values().map(|runtime| runtime.state()))
+        let servers = self.runtimes().await;
+        join_all(servers.iter().map(|runtime| runtime.state()))
             .await
             .into_iter()
             .filter(|state| *state == LifecycleState::Connected)
@@ -256,25 +648,68 @@ impl RuntimeManager {
 
     /// Returns the number of servers with a recorded runtime failure.
     pub async fn failed_count(&self) -> u64 {
-        join_all(self.servers.values().map(|runtime| runtime.state()))
+        let servers = self.runtimes().await;
+        join_all(servers.iter().map(|runtime| runtime.state()))
             .await
             .into_iter()
             .filter(|state| *state == LifecycleState::Failed)
             .count() as u64
     }
 
-    fn server(&self, server_id: &str, operation: &str) -> Result<Arc<ServerRuntime>, RuntimeError> {
+    async fn server(
+        &self,
+        server_id: &str,
+        operation: &str,
+    ) -> Result<Arc<ServerRuntime>, RuntimeError> {
         let normalized = ServerId::parse(server_id)
             .map(|id| id.as_str().to_owned())
             .unwrap_or_else(|_| server_id.to_owned());
-        self.servers.get(&normalized).cloned().ok_or_else(|| {
-            RuntimeError::for_server(
-                RuntimeErrorCode::ServerNotFound,
-                operation,
-                server_id,
-                "the server is not registered",
-            )
-        })
+        self.catalog
+            .read()
+            .await
+            .servers
+            .get(&normalized)
+            .cloned()
+            .ok_or_else(|| {
+                RuntimeError::for_server(
+                    RuntimeErrorCode::ServerNotFound,
+                    operation,
+                    server_id,
+                    "the server is not registered",
+                )
+            })
+    }
+
+    async fn runtimes(&self) -> Vec<Arc<ServerRuntime>> {
+        self.catalog
+            .read()
+            .await
+            .servers
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    async fn policy(&self) -> Arc<Policy> {
+        Arc::clone(&self.catalog.read().await.policy)
+    }
+
+    async fn authorize(
+        &self,
+        action: PolicyAction,
+        server_id: &str,
+        tool_name: Option<&str>,
+        operation: &str,
+    ) -> Result<(), RuntimeError> {
+        if self.policy().await.check(action, server_id, tool_name) == PolicyDecision::Allow {
+            return Ok(());
+        }
+        Err(RuntimeError::for_server(
+            RuntimeErrorCode::PolicyDenied,
+            operation,
+            server_id,
+            "the operation is denied by policy",
+        ))
     }
 }
 
@@ -285,6 +720,12 @@ struct ServerRuntime {
     state: Mutex<RuntimeState>,
     changed: Notify,
     tools: Arc<Mutex<Option<ToolSnapshot>>>,
+    shutdown: CancellationToken,
+    recovery_cancel: Mutex<Option<CancellationToken>>,
+    recovery_tasks: AtomicU64,
+    recovery_changed: Notify,
+    auth: Option<ServerAuth>,
+    auth_logout_in_progress: AtomicBool,
 }
 
 struct RuntimeState {
@@ -326,6 +767,10 @@ struct ClientEvents {
 }
 
 impl ClientHandler for ClientEvents {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default().with_protocol_version(ProtocolVersion::V_2025_11_25)
+    }
+
     async fn on_tool_list_changed(&self, _context: rmcp::service::NotificationContext<RoleClient>) {
         if let Some(snapshot) = self.tools.lock().await.as_mut() {
             snapshot.stale = true;
@@ -334,7 +779,22 @@ impl ClientHandler for ClientEvents {
 }
 
 impl ServerRuntime {
-    fn new(id: String, registered: RegisteredServer, settings: RuntimeSettings) -> Self {
+    fn new(
+        id: String,
+        registered: RegisteredServer,
+        settings: RuntimeSettings,
+        shutdown: CancellationToken,
+    ) -> Self {
+        let auth = match (
+            registered.resolved_manifest().auth.clone(),
+            &registered.resolved_manifest().transport,
+            settings.auth_root.as_deref(),
+        ) {
+            (Some(config), ResolvedTransportConfig::Http { url, .. }, Some(root)) => {
+                Some(ServerAuth::new(id.clone(), url.to_string(), config, root))
+            }
+            _ => None,
+        };
         Self {
             id,
             registered,
@@ -353,6 +813,12 @@ impl ServerRuntime {
             }),
             changed: Notify::new(),
             tools: Arc::new(Mutex::new(None)),
+            shutdown,
+            recovery_cancel: Mutex::new(None),
+            recovery_tasks: AtomicU64::new(0),
+            recovery_changed: Notify::new(),
+            auth,
+            auth_logout_in_progress: AtomicBool::new(false),
         }
     }
 
@@ -397,12 +863,37 @@ impl ServerRuntime {
         self.state.lock().await.lifecycle.state()
     }
 
+    async fn desired(&self) -> DesiredConnection {
+        self.state.lock().await.lifecycle.desired()
+    }
+
     async fn connect(self: &Arc<Self>) -> Result<ConnectResult, RuntimeError> {
+        self.cancel_recovery().await;
+        self.connect_inner().await
+    }
+
+    async fn connect_inner(self: &Arc<Self>) -> Result<ConnectResult, RuntimeError> {
+        if self.shutdown.is_cancelled() {
+            return Err(self.error(
+                RuntimeErrorCode::DaemonShuttingDown,
+                "connect_server",
+                "the daemon is shutting down",
+            ));
+        }
         if !self.registered.enabled() {
             return Err(self.error(
                 RuntimeErrorCode::ServerDisabled,
                 "connect_server",
                 "the server is disabled",
+            ));
+        }
+        if self.auth_logout_in_progress.load(Ordering::Acquire)
+            || matches!(&self.auth, Some(auth) if auth.in_progress().await)
+        {
+            return Err(self.error(
+                RuntimeErrorCode::AuthInProgress,
+                "connect_server",
+                "an OAuth operation is in progress",
             ));
         }
 
@@ -463,7 +954,7 @@ impl ServerRuntime {
                     if let Some(session) = old_session {
                         let _ = close_session(session, self.settings.shutdown_grace).await;
                     }
-                    let result = self.start_session(cancel).await;
+                    let result = self.start_session(cancel, epoch).await;
                     return self.finish_connect(epoch, result).await;
                 }
             }
@@ -473,6 +964,7 @@ impl ServerRuntime {
     async fn start_session(
         self: &Arc<Self>,
         cancellation: CancellationToken,
+        session_epoch: u64,
     ) -> Result<(ManagedSession, Value, Value, Option<u32>), RuntimeError> {
         let events = ClientEvents {
             tools: Arc::clone(&self.tools),
@@ -480,11 +972,21 @@ impl ServerRuntime {
         let (mut service, pid, mut stderr, stderr_tail) =
             match self.registered.resolved_manifest().transport.clone() {
                 ResolvedTransportConfig::Stdio {
-                    command,
+                    mut command,
                     args,
                     working_directory,
                     environment,
                 } => {
+                    if let (Some(root), Some(provision)) = (
+                        self.settings.package_root.as_ref(),
+                        self.registered.resolved_manifest().provision.as_ref(),
+                    ) {
+                        let installer = PackageInstaller::new(root.clone());
+                        let installed = installer.binary_path(&self.id, provision);
+                        if installed.is_file() {
+                            command = installed.display().to_string();
+                        }
+                    }
                     let mut command_line = tokio::process::Command::new(command);
                     command_line.args(args);
                     if let Some(directory) = working_directory {
@@ -498,6 +1000,11 @@ impl ServerRuntime {
                         .map(|value| value.expose_secret().to_owned())
                         .filter(|value| !value.is_empty())
                         .collect::<Vec<_>>();
+                    let mut command_line = CommandWrap::from(command_line);
+                    #[cfg(unix)]
+                    command_line.wrap(ProcessGroup::leader());
+                    #[cfg(windows)]
+                    command_line.wrap(JobObject);
                     let (transport, stderr) = TokioChildProcess::builder(command_line)
                         .stderr(Stdio::piped())
                         .spawn()
@@ -570,22 +1077,58 @@ impl ServerRuntime {
                     let headers = resolve_headers(headers, &self.id)?;
                     let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
                         .custom_headers(headers);
-                    let transport = StreamableHttpClientTransport::from_config(config);
                     tracing::info!(
                         operation = "transport_start",
                         server_id = self.id,
                         transport = "http"
                     );
-                    if let Err(error) = self.begin_initializing().await {
-                        cancellation.cancel();
-                        drop(transport);
-                        return Err(error);
+                    let service = if let Some(auth) = &self.auth {
+                        let manager = auth.authenticated_manager().await?;
+                        let client = reqwest::Client::builder()
+                            .pool_max_idle_per_host(0)
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                            .map_err(|_| {
+                                self.error(
+                                    RuntimeErrorCode::HttpConnectionFailed,
+                                    "connect_server",
+                                    "the HTTP client could not be created",
+                                )
+                            })?;
+                        let transport = StreamableHttpClientTransport::with_client(
+                            AuthClient::new(client, manager),
+                            config,
+                        );
+                        if let Err(error) = self.begin_initializing().await {
+                            cancellation.cancel();
+                            drop(transport);
+                            return Err(error);
+                        }
+                        timeout(
+                            self.settings.connect_timeout,
+                            events.serve_with_ct(transport, cancellation.clone()),
+                        )
+                        .await
+                    } else {
+                        if self.registered.resolved_manifest().auth.is_some() {
+                            return Err(self.error(
+                                RuntimeErrorCode::AuthFailed,
+                                "connect_server",
+                                "the OAuth credential store is unavailable",
+                            ));
+                        }
+                        let transport = StreamableHttpClientTransport::from_config(config);
+                        if let Err(error) = self.begin_initializing().await {
+                            cancellation.cancel();
+                            drop(transport);
+                            return Err(error);
+                        }
+                        timeout(
+                            self.settings.connect_timeout,
+                            events.serve_with_ct(transport, cancellation.clone()),
+                        )
+                        .await
                     }
-                    let service = timeout(
-                        self.settings.connect_timeout,
-                        events.serve_with_ct(transport, cancellation.clone()),
-                    )
-                    .await
                     .map_err(|_| {
                         self.error(
                             RuntimeErrorCode::HttpConnectionFailed,
@@ -642,7 +1185,12 @@ impl ServerRuntime {
             .map(safe_peer_info)
             .unwrap_or((Value::Null, Value::Null));
         let close_token = CancellationToken::new();
-        let monitor = spawn_monitor(Arc::downgrade(self), peer, close_token.clone());
+        let monitor = spawn_monitor(
+            Arc::downgrade(self),
+            peer,
+            close_token.clone(),
+            session_epoch,
+        );
         Ok((
             ManagedSession {
                 service,
@@ -767,6 +1315,7 @@ impl ServerRuntime {
     }
 
     async fn disconnect(self: &Arc<Self>) -> Result<DisconnectResult, RuntimeError> {
+        self.cancel_recovery().await;
         loop {
             let action =
                 {
@@ -879,8 +1428,8 @@ impl ServerRuntime {
         }
     }
 
-    async fn refresh(&self) -> Result<ToolSnapshot, RuntimeError> {
-        let peer = {
+    async fn refresh(self: &Arc<Self>) -> Result<ToolSnapshot, RuntimeError> {
+        let (peer, session_epoch) = {
             let state = self.state.lock().await;
             if state.lifecycle.state() != LifecycleState::Connected {
                 return Err(self.error(
@@ -889,7 +1438,7 @@ impl ServerRuntime {
                     "the server is not connected",
                 ));
             }
-            state
+            let peer = state
                 .session
                 .as_ref()
                 .map(|session| session.service.peer().clone())
@@ -899,7 +1448,8 @@ impl ServerRuntime {
                         "refresh_server",
                         "the server session is unavailable",
                     )
-                })?
+                })?;
+            (peer, state.epoch)
         };
         let result = timeout(self.settings.request_timeout, peer.list_all_tools()).await;
         match result {
@@ -911,7 +1461,7 @@ impl ServerRuntime {
             Ok(Err(error)) => {
                 mark_stale(&self.tools).await;
                 if matches!(error, ServiceError::TransportClosed) {
-                    self.mark_transport_closed().await;
+                    self.mark_transport_closed(session_epoch).await;
                 }
                 Err(self.error(
                     RuntimeErrorCode::ProtocolError,
@@ -931,7 +1481,7 @@ impl ServerRuntime {
     }
 
     async fn call_tool(
-        &self,
+        self: &Arc<Self>,
         tool_name: &str,
         arguments: Value,
         timeout_ms: Option<u64>,
@@ -953,7 +1503,7 @@ impl ServerRuntime {
                 ));
             }
         };
-        let (peer, found) = {
+        let (peer, found, session_epoch) = {
             let state = self.state.lock().await;
             if state.lifecycle.state() != LifecycleState::Connected {
                 return Err(self.error(
@@ -977,7 +1527,7 @@ impl ServerRuntime {
                 self.tools.lock().await.as_ref().is_some_and(|snapshot| {
                     snapshot.tools.iter().any(|tool| tool.name == tool_name)
                 });
-            (peer, found)
+            (peer, found, state.epoch)
         };
         if !found {
             return Err(self.error(
@@ -996,7 +1546,7 @@ impl ServerRuntime {
             Ok(handle) => handle,
             Err(error) => {
                 if matches!(error, ServiceError::TransportClosed) {
-                    self.mark_transport_closed().await;
+                    self.mark_transport_closed(session_epoch).await;
                 }
                 return Err(self.request_error("call_tool", error));
             }
@@ -1022,7 +1572,7 @@ impl ServerRuntime {
                 "the downstream tool call timed out",
             )),
             Err(ServiceError::TransportClosed) => {
-                self.mark_transport_closed().await;
+                self.mark_transport_closed(session_epoch).await;
                 Err(self.error(
                     RuntimeErrorCode::TransportClosed,
                     "call_tool",
@@ -1045,11 +1595,15 @@ impl ServerRuntime {
         })
     }
 
-    async fn mark_transport_closed(&self) {
-        let mut state = self.state.lock().await;
-        if state.lifecycle.desired() == DesiredConnection::Connected
-            && state.lifecycle.state() == LifecycleState::Connected
-        {
+    async fn mark_transport_closed(self: &Arc<Self>, session_epoch: u64) {
+        let should_recover = {
+            let mut state = self.state.lock().await;
+            if state.epoch != session_epoch
+                || state.lifecycle.desired() != DesiredConnection::Connected
+                || state.lifecycle.state() != LifecycleState::Connected
+            {
+                return;
+            }
             let error = self.error(
                 RuntimeErrorCode::TransportClosed,
                 "monitor",
@@ -1059,8 +1613,6 @@ impl ServerRuntime {
             if state.last_safe_error.is_none() {
                 state.last_safe_error = Some(error.clone());
             }
-            mark_stale(&self.tools).await;
-            self.changed.notify_waiters();
             tracing::warn!(
                 operation = "lifecycle_transition",
                 server_id = self.id,
@@ -1068,11 +1620,132 @@ impl ServerRuntime {
                 success = false,
                 error_code = error.code.as_str()
             );
+            self.registered.resolved_manifest().reconnect.enabled
+        };
+        mark_stale(&self.tools).await;
+        self.changed.notify_waiters();
+        if should_recover {
+            self.schedule_recovery().await;
+        }
+    }
+
+    async fn schedule_recovery(self: &Arc<Self>) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        let cancel = {
+            let mut recovery = self.recovery_cancel.lock().await;
+            if recovery.is_some() {
+                return;
+            }
+            let cancel = CancellationToken::new();
+            *recovery = Some(cancel.clone());
+            cancel
+        };
+        self.recovery_tasks.fetch_add(1, Ordering::AcqRel);
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            runtime.reconnect_loop(cancel).await;
+            *runtime.recovery_cancel.lock().await = None;
+            runtime.recovery_tasks.fetch_sub(1, Ordering::AcqRel);
+            runtime.recovery_changed.notify_waiters();
+        });
+    }
+
+    async fn reconnect_loop(self: &Arc<Self>, cancel: CancellationToken) {
+        let config = self.registered.resolved_manifest().reconnect.clone();
+        for attempt in 0..config.max_retries {
+            let delay = reconnect_delay(&config, attempt, &self.id);
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
+            if self.desired().await != DesiredConnection::Connected {
+                return;
+            }
+            tracing::info!(
+                operation = "automatic_reconnect",
+                server_id = self.id,
+                attempt = attempt + 1,
+                delay_ms = duration_ms(delay)
+            );
+            match self.connect_inner().await {
+                Ok(_) => return,
+                Err(error) if error.code == RuntimeErrorCode::AuthRequired => return,
+                Err(_) => {}
+            }
+        }
+    }
+
+    async fn cancel_recovery(&self) {
+        if let Some(cancel) = self.recovery_cancel.lock().await.as_ref() {
+            cancel.cancel();
+        }
+    }
+
+    async fn wait_for_recovery(&self) {
+        loop {
+            let notified = self.recovery_changed.notified();
+            if self.recovery_tasks.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 
     fn error(&self, code: RuntimeErrorCode, operation: &str, message: &str) -> RuntimeError {
         RuntimeError::for_server(code, operation, &self.id, message)
+    }
+
+    async fn auth_start(&self, redirect_uri: &str) -> Result<AuthLoginStartResult, RuntimeError> {
+        if self.auth_logout_in_progress.load(Ordering::Acquire) {
+            return Err(self.error(
+                RuntimeErrorCode::AuthInProgress,
+                "auth_start",
+                "an OAuth logout is in progress",
+            ));
+        }
+        let state = self.state.lock().await;
+        if state.lifecycle.state() == LifecycleState::Connected || state.operation.is_some() {
+            return Err(self.error(
+                RuntimeErrorCode::AuthInProgress,
+                "auth_start",
+                "disconnect the server before starting OAuth authorization",
+            ));
+        }
+        drop(state);
+        self.oauth("auth_start")?.start(redirect_uri).await
+    }
+
+    fn begin_auth_logout(&self) -> Result<AuthLogoutGuard<'_>, RuntimeError> {
+        self.auth_logout_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                self.error(
+                    RuntimeErrorCode::AuthInProgress,
+                    "auth_logout",
+                    "an OAuth logout is already in progress",
+                )
+            })?;
+        Ok(AuthLogoutGuard(&self.auth_logout_in_progress))
+    }
+
+    fn oauth(&self, operation: &str) -> Result<&ServerAuth, RuntimeError> {
+        if self.registered.resolved_manifest().auth.is_none() {
+            return Err(self.error(
+                RuntimeErrorCode::AuthNotConfigured,
+                operation,
+                "the server manifest has no OAuth configuration",
+            ));
+        }
+        self.auth.as_ref().ok_or_else(|| {
+            self.error(
+                RuntimeErrorCode::AuthFailed,
+                operation,
+                "the OAuth credential store is unavailable",
+            )
+        })
     }
 
     fn request_error(&self, operation: &str, error: ServiceError) -> RuntimeError {
@@ -1134,6 +1807,14 @@ impl ServerRuntime {
     }
 }
 
+struct AuthLogoutGuard<'a>(&'a AtomicBool);
+
+impl Drop for AuthLogoutGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 enum ConnectAction {
     Wait {
         epoch: u64,
@@ -1183,6 +1864,11 @@ fn public_manifest(server: &RegisteredServer) -> Value {
             "port": url.port(),
             "path": url.path(),
             "headerNames": headers.keys().collect::<Vec<_>>(),
+            "oauth": manifest.auth.as_ref().map(|auth| json!({
+                "enabled": true,
+                "clientIdConfigured": auth.client_id.is_some(),
+                "scopes": auth.scopes,
+            })),
         }),
     };
     json!({
@@ -1246,7 +1932,6 @@ fn tool_definition(tool: Tool) -> Result<ToolDefinition, RuntimeError> {
             .output_schema
             .map(|schema| Value::Object(schema.as_ref().clone())),
         annotations: value_or_none(tool.annotations)?,
-        execution: value_or_none(tool.execution)?,
         icons: value_or_none(tool.icons)?,
         meta: value_or_none(tool.meta)?,
     })
@@ -1298,6 +1983,7 @@ fn spawn_monitor(
     runtime: Weak<ServerRuntime>,
     peer: Peer<RoleClient>,
     close_token: CancellationToken,
+    session_epoch: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1306,7 +1992,7 @@ fn spawn_monitor(
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {
                     if peer.is_transport_closed() {
                         if let Some(runtime) = runtime.upgrade() {
-                            runtime.mark_transport_closed().await;
+                            runtime.mark_transport_closed(session_epoch).await;
                         }
                         return;
                     }
@@ -1314,6 +2000,27 @@ fn spawn_monitor(
             }
         }
     })
+}
+
+fn reconnect_delay(config: &ReconnectConfig, attempt: u32, server_id: &str) -> Duration {
+    let exponent = attempt.min(31);
+    let base = config
+        .initial_backoff_ms
+        .saturating_mul(1_u64 << exponent)
+        .min(config.max_backoff_ms);
+    if !config.jitter || base < 5 {
+        return Duration::from_millis(base);
+    }
+
+    let spread = base / 5;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in server_id.bytes().chain(attempt.to_le_bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let width = spread.saturating_mul(2).saturating_add(1);
+    let offset = hash % width;
+    Duration::from_millis(base.saturating_sub(spread).saturating_add(offset))
 }
 
 fn spawn_stderr_drain(
@@ -1464,14 +2171,16 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use mcp_host_core::{
-        EnvironmentAccessError, EnvironmentProvider, ManifestLoader, McpServerRegistry,
-        RegistryBuilder,
+        EnvironmentAccessError, EnvironmentProvider, ManifestLoader, McpServerRegistry, Policy,
+        ReconnectConfig, RegistryBuilder, SkillCatalog,
     };
     use rmcp::model::Tool;
     use serde_json::{Map, json};
     use tempfile::tempdir;
 
-    use super::{RuntimeManager, RuntimeSettings, sanitize_pending, tool_definition};
+    use super::{
+        RuntimeManager, RuntimeSettings, reconnect_delay, sanitize_pending, tool_definition,
+    };
 
     struct EmptyEnvironment;
 
@@ -1517,6 +2226,97 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "zeta"]
         );
+    }
+
+    #[tokio::test]
+    async fn registry_reload_reconciles_add_change_remove_and_noop() {
+        let manager = manager("alpha", true);
+
+        let added = manager
+            .reload_registry(Arc::new(registry(&[("alpha", true), ("beta", true)])))
+            .await;
+        assert_eq!((added.added, added.changed, added.removed), (1, 0, 0));
+        assert_eq!(added.generation, 2);
+        assert_eq!(manager.server_count(), 2);
+
+        let noop = manager
+            .reload_registry(Arc::new(registry(&[("alpha", true), ("beta", true)])))
+            .await;
+        assert_eq!((noop.added, noop.changed, noop.removed), (0, 0, 0));
+        assert_eq!(noop.generation, 2);
+
+        let changed = manager
+            .reload_registry(Arc::new(registry(&[("alpha", false)])))
+            .await;
+        assert_eq!((changed.added, changed.changed, changed.removed), (0, 1, 1));
+        assert_eq!(changed.generation, 3);
+        let entries = manager.list_servers().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "alpha");
+        assert!(!entries[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn policy_denial_is_enforced_and_reloads_atomically() {
+        let registry = Arc::new(registry(&[("alpha", true)]));
+        let manager = RuntimeManager::new_with_policy(
+            Arc::clone(&registry),
+            RuntimeSettings::default(),
+            policy(
+                r#"
+                    [[rules]]
+                    id = "deny-connect"
+                    action = "connect"
+                    effect = "deny"
+                    server = "alpha"
+                "#,
+            ),
+        );
+        let error = manager
+            .connect_server("alpha")
+            .await
+            .expect_err("policy should deny connect before process startup");
+        assert_eq!(error.code.as_str(), "POLICY_DENIED");
+
+        let result = manager
+            .reload_configuration(
+                registry,
+                policy(
+                    r#"
+                        [[rules]]
+                        id = "hide-alpha"
+                        action = "list"
+                        effect = "deny"
+                        server = "alpha"
+                    "#,
+                ),
+                SkillCatalog::default(),
+            )
+            .await;
+        assert!(result.policy_changed);
+        assert_eq!(result.generation, 2);
+        assert!(manager.list_servers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn skill_catalog_reloads_with_the_same_atomic_generation() {
+        let registry = Arc::new(registry(&[("alpha", true)]));
+        let manager = RuntimeManager::new(Arc::clone(&registry), RuntimeSettings::default());
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("one.skill.toml"),
+            "id='one'\nname='One'\ndescription='One'\n[[steps]]\nid='run'\nserver='alpha'\ntool='echo'\n",
+        )
+        .expect("skill fixture");
+        let skills = SkillCatalog::load_directory(directory.path()).expect("skill catalog");
+
+        let result = manager
+            .reload_configuration(registry, Policy::default(), skills)
+            .await;
+        assert!(result.skills_changed);
+        assert!(!result.policy_changed);
+        assert_eq!(result.generation, 2);
+        assert_eq!(manager.list_skills().await[0].id, "one");
     }
 
     #[test]
@@ -1565,6 +2365,25 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    #[test]
+    fn reconnect_delay_is_capped_and_jitter_is_bounded() {
+        let mut config = ReconnectConfig {
+            enabled: true,
+            max_retries: 5,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 350,
+            jitter: false,
+        };
+        assert_eq!(reconnect_delay(&config, 0, "server").as_millis(), 100);
+        assert_eq!(reconnect_delay(&config, 1, "server").as_millis(), 200);
+        assert_eq!(reconnect_delay(&config, 2, "server").as_millis(), 350);
+        assert_eq!(reconnect_delay(&config, 10, "server").as_millis(), 350);
+
+        config.jitter = true;
+        let jittered = reconnect_delay(&config, 2, "server").as_millis();
+        assert!((280..=420).contains(&jittered));
+    }
+
     fn manager(id: &str, enabled: bool) -> Arc<RuntimeManager> {
         let registry = registry(&[(id, enabled)]);
         RuntimeManager::new(Arc::new(registry), RuntimeSettings::default())
@@ -1600,5 +2419,12 @@ mod tests {
             .load_directory(directory.path())
             .expect("manifests should load");
         RegistryBuilder::build(loaded).expect("registry should build")
+    }
+
+    fn policy(contents: &str) -> Policy {
+        let directory = tempdir().expect("temporary policy directory");
+        fs::write(directory.path().join("policy.toml"), contents)
+            .expect("policy fixture should write");
+        Policy::load_optional(directory.path()).expect("policy fixture should load")
     }
 }

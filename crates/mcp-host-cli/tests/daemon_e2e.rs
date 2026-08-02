@@ -133,14 +133,14 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
 
     let listed = call_host_tool(&client, "list_servers", json!({})).await;
     assert_eq!(
-        listed.structured_content.as_ref().expect("structured")["servers"][0]["id"],
+        host_envelope(&listed, "list_servers")["data"]["servers"][0]["id"],
         "fixture"
     );
 
     let connected =
         call_host_tool(&client, "connect_server", json!({"server_id": "fixture"})).await;
     assert_eq!(
-        connected.structured_content.as_ref().expect("structured")["state"],
+        host_envelope(&connected, "connect_server")["data"]["state"],
         "connected"
     );
 
@@ -151,10 +151,7 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
     )
     .await;
     assert_eq!(
-        upstream_tools
-            .structured_content
-            .as_ref()
-            .expect("structured")["tool_count"],
+        host_envelope(&upstream_tools, "list_tools")["data"]["tool_count"],
         5
     );
 
@@ -169,7 +166,7 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
     )
     .await;
     assert_eq!(
-        echo.structured_content.as_ref().expect("structured")["message"],
+        host_envelope(&echo, "call_tool")["data"]["result"]["structuredContent"]["message"],
         "full chain"
     );
 
@@ -189,16 +186,19 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
         }),
     )
     .await;
-    let batch = batch.structured_content.as_ref().expect("structured");
-    assert_eq!(batch["results"][0]["tool_name"], "echo");
+    let batch = host_envelope(&batch, "call_tools");
+    assert_eq!(batch["data"]["results"][0]["tool_name"], "echo");
     assert_eq!(
-        batch["results"][0]["result"]["structuredContent"]["message"],
+        batch["data"]["results"][0]["result"]["structuredContent"]["message"],
         "host batch"
     );
-    assert_eq!(batch["results"][1]["status"], "error");
-    assert_eq!(batch["results"][1]["error"]["code"], "TOOL_NOT_FOUND");
-    assert_eq!(batch["results"][2]["status"], "success");
-    assert_eq!(batch["results"][2]["result"]["isError"], true);
+    assert_eq!(batch["data"]["results"][1]["status"], "error");
+    assert_eq!(
+        batch["data"]["results"][1]["error"]["code"],
+        "TOOL_NOT_FOUND"
+    );
+    assert_eq!(batch["data"]["results"][2]["status"], "success");
+    assert_eq!(batch["data"]["results"][2]["result"]["isError"], true);
 
     call_host_tool(
         &client,
@@ -221,7 +221,7 @@ async fn cli_and_two_mcp_clients_share_one_upstream_runtime() {
     let inspected =
         call_host_tool(&client_a, "inspect_server", json!({"server_id": "fixture"})).await;
     assert_eq!(
-        inspected.structured_content.as_ref().expect("structured")["observed_state"],
+        host_envelope(&inspected, "inspect_server")["data"]["observed_state"],
         "connected"
     );
     let echo = call_host_tool(
@@ -235,7 +235,7 @@ async fn cli_and_two_mcp_clients_share_one_upstream_runtime() {
     )
     .await;
     assert_eq!(
-        echo.structured_content.as_ref().expect("structured")["message"],
+        host_envelope(&echo, "call_tool")["data"]["result"]["structuredContent"]["message"],
         "shared"
     );
     let tools = call_host_tool(
@@ -244,10 +244,7 @@ async fn cli_and_two_mcp_clients_share_one_upstream_runtime() {
         json!({"server_id": "fixture", "refresh": false}),
     )
     .await;
-    assert_eq!(
-        tools.structured_content.as_ref().expect("structured")["tool_count"],
-        5
-    );
+    assert_eq!(host_envelope(&tools, "list_tools")["data"]["tool_count"], 5);
     assert_eq!(daemon.startup_count(), 1);
 
     call_host_tool(
@@ -289,6 +286,151 @@ async fn second_daemon_is_rejected_without_harming_the_active_daemon() {
     let status = daemon.cli_json(&["daemon", "status"]);
     assert_success(&status);
     assert_eq!(parse_stdout(&status)["registry_server_count"], 1);
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn daemon_hot_reload_adds_removes_and_rejects_invalid_snapshots() {
+    let mut daemon = TestDaemon::start().await;
+    let second = daemon.config_dir.join("second.toml");
+    fs::write(
+        &second,
+        "id = \"second\"\nname = \"Second\"\ndescription = \"Hot reload\"\nenabled = false\n[transport]\ntype = \"stdio\"\ncommand = \"unused\"\n",
+    )
+    .expect("second manifest should be written");
+    daemon.wait_server_count(2).await;
+
+    let invalid = daemon.config_dir.join("invalid.toml");
+    fs::write(&invalid, "not = \"a server manifest\"\n")
+        .expect("invalid manifest should be written");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        parse_stdout(&daemon.cli_json(&["list"]))
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    fs::remove_file(invalid).expect("invalid manifest should be removed");
+    fs::remove_file(second).expect("second manifest should be removed");
+    daemon.wait_server_count(1).await;
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn daemon_hot_reload_publishes_policy_changes() {
+    let mut daemon = TestDaemon::start().await;
+    let policy = daemon.config_dir.join("policy.toml");
+    fs::write(
+        &policy,
+        "[[rules]]\nid = \"hide-fixture\"\naction = \"list\"\neffect = \"deny\"\nserver = \"fixture\"\n",
+    )
+    .expect("policy should be written");
+    daemon.wait_server_count(0).await;
+
+    fs::remove_file(policy).expect("policy should be removed");
+    daemon.wait_server_count(1).await;
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn daemon_hot_reload_runs_skills_and_preserves_the_last_valid_snapshot() {
+    let mut daemon = TestDaemon::start().await;
+    let skill_path = daemon.config_dir.join("echo.skill.toml");
+    let valid_skill = r#"
+        id = "echo-skill"
+        name = "Echo skill"
+        description = "Daemon skill fixture"
+
+        [[inputs]]
+        name = "message"
+        type = "string"
+
+        [[steps]]
+        id = "echo"
+        server = "fixture"
+        tool = "echo"
+        arguments = { message = "${input.message}" }
+    "#;
+    fs::write(&skill_path, valid_skill).expect("skill should be written");
+    daemon.wait_skill_count(1).await;
+    assert_eq!(
+        parse_stdout(&daemon.cli_json(&["list"]))
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "skill files must not be parsed as server manifests"
+    );
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+    let output = daemon.cli_json(&[
+        "skill",
+        "run",
+        "echo-skill",
+        "--input",
+        "{\"message\":\"hello\"}",
+    ]);
+    assert_success(&output);
+    assert_eq!(parse_stdout(&output)["status"], "ok");
+    assert_eq!(
+        parse_stdout(&output)["results"][0]["result"]["structuredContent"]["message"],
+        "hello"
+    );
+
+    fs::write(
+        &skill_path,
+        "id='echo-skill'\nname='Invalid'\ndescription='Invalid'\n[[steps]]\nid='first'\nserver='fixture'\ntool='echo'\narguments={message='${steps.later.output}'}\n",
+    )
+    .expect("invalid skill should be written");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let retained = daemon.cli_json(&[
+        "skill",
+        "run",
+        "echo-skill",
+        "--input",
+        "{\"message\":\"retained\"}",
+    ]);
+    assert_success(&retained);
+    assert_eq!(parse_stdout(&retained)["status"], "ok");
+
+    fs::write(&skill_path, valid_skill).expect("valid skill should be restored");
+    fs::write(
+        daemon.config_dir.join("policy.toml"),
+        "[[rules]]\nid='deny-skill'\naction='skill_run'\neffect='deny'\nskill='echo-*'\n",
+    )
+    .expect("skill policy should be written");
+    daemon.wait_skill_denied("echo-skill").await;
+    fs::remove_file(daemon.config_dir.join("policy.toml")).expect("policy should be removed");
+    daemon.wait_skill_allowed("echo-skill").await;
+
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn package_install_requires_a_manifest_provision_section() {
+    let mut daemon = TestDaemon::start().await;
+    let output = daemon.cli_json(&["package", "install", "fixture"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        parse_stdout(&output)["error"]["code"],
+        "PACKAGE_NOT_CONFIGURED"
+    );
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn oauth_status_requires_an_auth_manifest_section() {
+    let mut daemon = TestDaemon::start().await;
+    let output = daemon.cli_json(&["auth", "status", "fixture"]);
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        parse_stdout(&output)["error"]["code"],
+        "AUTH_NOT_CONFIGURED"
+    );
     daemon.stop();
     daemon.assert_clean_shutdown();
 }
@@ -341,6 +483,17 @@ async fn call_host_tool(
         .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments))
         .await
         .expect("host tool should succeed")
+}
+
+fn host_envelope<'a>(result: &'a CallToolResult, operation: &str) -> &'a Value {
+    let envelope = result
+        .structured_content
+        .as_ref()
+        .expect("structured result");
+    assert_eq!(envelope["schema_version"], "dynamic-mcp/v1");
+    assert_eq!(envelope["operation"], operation);
+    assert_eq!(envelope["ok"], true);
+    envelope
 }
 
 struct TestDaemon {
@@ -405,6 +558,74 @@ impl TestDaemon {
         })
         .await
         .expect("daemon should become ready");
+    }
+
+    async fn wait_server_count(&self, expected: usize) {
+        tokio::time::timeout(PROCESS_TIMEOUT, async {
+            loop {
+                let output = self.cli_json(&["list"]);
+                if output.status.success()
+                    && parse_stdout(&output).as_array().map(Vec::len) == Some(expected)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("daemon should publish the reloaded registry");
+    }
+
+    async fn wait_skill_count(&self, expected: usize) {
+        tokio::time::timeout(PROCESS_TIMEOUT, async {
+            loop {
+                let output = self.cli_json(&["skill", "list"]);
+                if output.status.success()
+                    && parse_stdout(&output).as_array().map(Vec::len) == Some(expected)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("daemon should publish the reloaded skill catalog");
+    }
+
+    async fn wait_skill_denied(&self, skill_id: &str) {
+        tokio::time::timeout(PROCESS_TIMEOUT, async {
+            loop {
+                let output = self.cli_json(&["skill", "run", skill_id]);
+                if output.status.code() == Some(4)
+                    && parse_stdout(&output)["error"]["code"] == "POLICY_DENIED"
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("daemon should publish the skill deny policy");
+    }
+
+    async fn wait_skill_allowed(&self, skill_id: &str) {
+        tokio::time::timeout(PROCESS_TIMEOUT, async {
+            loop {
+                let output = self.cli_json(&[
+                    "skill",
+                    "run",
+                    skill_id,
+                    "--input",
+                    "{\"message\":\"allowed\"}",
+                ]);
+                if output.status.success() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("daemon should remove the skill deny policy");
     }
 
     fn cli_json(&self, arguments: &[&str]) -> Output {

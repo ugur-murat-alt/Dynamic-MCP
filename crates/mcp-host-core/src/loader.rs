@@ -205,7 +205,10 @@ fn is_discoverable_manifest(path: &Path) -> bool {
     };
     let file_name = file_name.to_string_lossy();
 
-    !file_name.starts_with(['.', '~', '#']) && has_toml_extension(path)
+    file_name != "policy.toml"
+        && !file_name.ends_with(".skill.toml")
+        && !file_name.starts_with(['.', '~', '#'])
+        && has_toml_extension(path)
 }
 
 fn has_toml_extension(path: &Path) -> bool {
@@ -242,6 +245,13 @@ mod tests {
         fs::write(directory.path().join("ignored.json"), "{}").expect("fixture should write");
         fs::write(directory.path().join("ignored.toml~"), "temporary")
             .expect("fixture should write");
+        fs::write(directory.path().join("policy.toml"), "default = \"allow\"")
+            .expect("policy fixture should write");
+        fs::write(
+            directory.path().join("ignored.skill.toml"),
+            "id = \"ignored\"",
+        )
+        .expect("skill fixture should write");
         let nested = directory.path().join("nested");
         fs::create_dir(&nested).expect("nested directory should be created");
         write_manifest(&nested.join("nested.toml"), "nested");

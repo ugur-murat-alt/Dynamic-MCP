@@ -22,13 +22,13 @@ Install a pinned release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh \
-  | sh -s -- --version v0.1.2
+  | sh -s -- --version v0.2.0
 ```
 
-`v0.1.0` remains an earlier release; pin `v0.1.2` for batch calls and HTTPS
-Streamable HTTP upstreams. v0.1.1 supports batch calls but lacks the HTTPS TLS
-feature. Upgrade the CLI and running daemon together when moving from v0.1.0,
-because that daemon does not recognize batch control requests.
+Pin `v0.2.0` for the RMCP 3 beta SDK migration, stable Host result envelope,
+and MCP-first harness skill. Earlier v0.1.x releases retain their documented
+behavior. Upgrade the CLI and running daemon together; control protocol v1 is
+unchanged, but the v0.2.0 Host MCP result contract is versioned separately.
 
 Choose another destination:
 
@@ -68,17 +68,44 @@ OpenCode configuration is global. Claude Code's default in Dynamic MCP Host is
 `user`, unlike Claude's own `local` default. Select `--scope local` for a private
 current-project entry or `--scope project` for a shareable `.mcp.json` entry.
 
-Registration is repeatable. OpenCode updates the same named global entry.
-Claude Code removes and recreates the same name only in the selected scope.
-Use `--name` when an existing registration must remain untouched.
+Registration is verified and repeatable. An exact semantic match is left
+unchanged. A missing or mismatched entry is repaired through the official
+harness CLI and read back from OpenCode's merged `config.json`, `opencode.json`,
+and `opencode.jsonc` view or the selected Claude scope; success is returned only
+when name, transport, command, and argv match.
 
-The harness CLI (`opencode` or `claude`) must be installed and on `PATH`. This
-step does not install either harness and does not start Dynamic MCP Host's
-daemon.
+Harness setup also installs the embedded `dynamic-mcp` skill and manages one
+marked instruction block without replacing user-authored content:
+
+| Harness | Skill | Managed instructions |
+| --- | --- | --- |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/skills/dynamic-mcp/SKILL.md`, falling back to `~/.config/opencode/...` | `$XDG_CONFIG_HOME/opencode/AGENTS.md`, falling back to `~/.config/opencode/AGENTS.md` |
+| Claude Code | `~/.claude/skills/dynamic-mcp/SKILL.md` | `~/.claude/CLAUDE.md` |
+
+Files are written only when content changes and are atomically replaced. A
+duplicate or unbalanced managed marker is rejected instead of guessing which
+section to overwrite. Use `--name` when an existing registration must remain
+untouched.
+
+If a harness must launch a daemon-bootstrap or supervisor wrapper, register its
+complete argv explicitly. No implicit `mcp` argument is appended in this mode:
+
+```bash
+mcp-host harness install opencode \
+  --bridge-command ~/.local/libexec/mcp-host/serve-bridge
+# Repeat --bridge-arg VALUE for wrapper arguments when needed.
+```
+
+`--bridge-command` cannot be combined with `--runtime-dir`; pass wrapper-specific
+options with repeated `--bridge-arg` values.
+
+The harness CLI (`opencode` or `claude`) must be installed and on `PATH` when a
+registration needs repair. This step does not install either harness and does
+not start Dynamic MCP Host's daemon.
 
 ## Start The Host
 
-Create one or more manifests, then run the daemon in the foreground:
+Create one or more manifests, then either run the daemon in the foreground:
 
 ```bash
 mcp-host daemon run --config-dir /absolute/path/to/manifests
@@ -86,6 +113,33 @@ mcp-host daemon run --config-dir /absolute/path/to/manifests
 
 The registered harness starts `mcp-host mcp`, which connects to that daemon.
 See [Manifest format](manifest-format.md) and [Daemon and IPC](daemon-and-ipc.md).
+
+For a managed background service, install the native service instead:
+
+```bash
+# systemd user service on Linux, launchd user agent on macOS
+mcp-host daemon service install --config-dir /absolute/path/to/manifests
+
+# Write and enable without starting immediately
+mcp-host daemon service install --config-dir /absolute/path/to/manifests --no-start
+
+mcp-host daemon service status --config-dir /absolute/path/to/manifests
+mcp-host daemon service uninstall --config-dir /absolute/path/to/manifests
+```
+
+`install` writes or repairs only Dynamic MCP-managed artifacts, enables/loads the
+service, and starts it unless `--no-start` is present. Reinstalling a running
+service restarts it so updated executable/config/runtime argv takes effect.
+`uninstall` stops and disables/unloads before removing the managed artifact.
+Foreign files or SCM records are never overwritten, stopped, or removed.
+
+Linux/macOS default to user scope; `--scope system` requires platform
+administrator privileges. Windows uses a native SCM LocalSystem service,
+defaults to system scope, requires an elevated terminal, and stores the default
+runtime below `%ProgramData%\Dynamic MCP\runtime`. Scheduled Tasks are not used.
+For systemd user services, Dynamic MCP does not enable login lingering; use the
+operating system's normal `loginctl enable-linger` administration if the service
+must survive logout.
 
 ## Upgrade
 

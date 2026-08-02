@@ -80,9 +80,13 @@ The registry is an immutable configuration snapshot. It contains no lifecycle,
 process handle, MCP peer, tool cache, retry state, or mutable connection state.
 At daemon startup, `RuntimeManager` consumes each
 `RegisteredServer::resolved_manifest()` and creates a separate per-server
-runtime entry. All CLI and inbound MCP sessions share that manager while the
-registry remains unchanged.
+runtime entry. All CLI and inbound MCP sessions share that manager. The daemon
+watches the configuration directory and atomically reconciles added, changed,
+and removed entries after a 500 ms debounce; invalid reloads preserve the prior
+snapshot. Root-level `*.skill.toml` files are excluded from server discovery and
+loaded into a separate immutable skill catalog. Registry, policy, and skill
+catalog validation succeeds before any of the three is published.
 
-Hot reload, file watching, remote registries, dynamic installation,
-permissions, and OAuth are deliberately absent from V1. Manifest changes take
-effect after a daemon restart.
+Remote registries and implicit package installation remain absent. Policy,
+explicit package installation, and OAuth configuration are loaded locally; none
+is stored as mutable registry runtime state.

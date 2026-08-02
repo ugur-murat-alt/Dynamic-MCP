@@ -5,19 +5,32 @@ use std::{
 };
 
 use clap::Parser as _;
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use mcp_host::cli::{
-    Batch, Call, Cli, Command, DaemonCommand, ExitCode as CliExitCode, HarnessCommand,
+    AuthCommand, Batch, Call, Cli, Command, DaemonCommand, ExitCode as CliExitCode, HarnessCommand,
+    PackageCommand, ServiceCommand, ServiceManager, ServiceOptions, SkillCommand,
+    SkillRun as SkillRunArgs,
 };
 use mcp_host::ipc::send_control;
+use mcp_host::service::{
+    ServiceArtifact, ServiceDescriptor, ServiceInstallOptions, ServiceManagerKind,
+    ServiceScope as DescriptorScope, ServiceStatus, render_descriptor,
+};
+use mcp_host::service_manager::{
+    ServiceOperationError, ServiceOperationErrorKind, ServiceRunState, install_service,
+    service_status, uninstall_service,
+};
 use mcp_host::{DaemonOptions, install_harnesses, run_daemon, run_stdio_bridge};
 use mcp_host_core::{
-    BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, ControlRequest, RuntimeError,
-    RuntimeErrorCode,
+    AuthLoginStartResult, BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse,
+    ControlRequest, RuntimeError, RuntimeErrorCode, SkillRunResult, SkillRunStatus,
 };
 use serde_json::{Value, json};
 
 const DEFAULT_CONTROL_TIMEOUT: Duration = Duration::from_secs(65);
+const DEFAULT_AUTH_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const AUTH_CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_SKILL_CONTROL_TIMEOUT: Duration = Duration::from_secs(4_805);
 const MCP_BRIDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
@@ -69,6 +82,7 @@ async fn execute(cli: Cli) -> Result<CliExitCode, RuntimeError> {
     };
     let runtime_dir = resolve_runtime_dir(runtime_dir)?;
     let control_timeout = timeout.map_or(DEFAULT_CONTROL_TIMEOUT, Duration::from_millis);
+    let auth_login_timeout = timeout.map_or(DEFAULT_AUTH_LOGIN_TIMEOUT, Duration::from_millis);
 
     match command {
         Command::Daemon(daemon) => match daemon.command {
@@ -91,6 +105,24 @@ async fn execute(cli: Cli) -> Result<CliExitCode, RuntimeError> {
                     json,
                 )
                 .await
+            }
+            DaemonCommand::Service(service) => execute_service(
+                service.command,
+                &runtime_dir,
+                runtime_dir_override.is_some(),
+                json,
+            ),
+            #[cfg(windows)]
+            DaemonCommand::ServiceRun(run) => {
+                mcp_host::run_windows_service(
+                    run.name,
+                    DaemonOptions {
+                        config_dir: run.config_dir,
+                        runtime_dir,
+                    },
+                )
+                .map_err(service_operation_error)?;
+                Ok(CliExitCode::Success)
             }
         },
         Command::List => {
@@ -193,12 +225,430 @@ async fn execute(cli: Cli) -> Result<CliExitCode, RuntimeError> {
         Command::Status => {
             execute_control(&runtime_dir, ControlRequest::Status, control_timeout, json).await
         }
+        Command::Auth(auth) => match auth.command {
+            AuthCommand::Login { server_id } => {
+                execute_auth_login(&runtime_dir, server_id, auth_login_timeout, json).await
+            }
+            AuthCommand::Status { server_id } => {
+                execute_control(
+                    &runtime_dir,
+                    ControlRequest::AuthStatus { server_id },
+                    control_timeout,
+                    json,
+                )
+                .await
+            }
+            AuthCommand::Logout { server_id } => {
+                execute_control(
+                    &runtime_dir,
+                    ControlRequest::AuthLogout { server_id },
+                    control_timeout,
+                    json,
+                )
+                .await
+            }
+        },
+        Command::Skill(skill) => match skill.command {
+            SkillCommand::List => {
+                execute_control(
+                    &runtime_dir,
+                    ControlRequest::SkillList,
+                    control_timeout,
+                    json,
+                )
+                .await
+            }
+            SkillCommand::Run(run) => {
+                let inputs = read_skill_inputs(&run).await?;
+                let skill_timeout =
+                    timeout.map_or(DEFAULT_SKILL_CONTROL_TIMEOUT, Duration::from_millis);
+                let result = send_control(
+                    &runtime_dir,
+                    &ControlRequest::SkillRun {
+                        skill_id: run.skill_id,
+                        inputs,
+                    },
+                    skill_timeout,
+                )
+                .await?;
+                let response: SkillRunResult =
+                    serde_json::from_value(result.clone()).map_err(|_| skill_response_error())?;
+                let exit_code = skill_exit_code(&response);
+                write_value(&result, json)?;
+                Ok(exit_code)
+            }
+        },
+        Command::Package(package) => match package.command {
+            PackageCommand::Install { server_id } => {
+                let package_timeout =
+                    timeout.map_or(Duration::from_secs(300), Duration::from_millis);
+                execute_control(
+                    &runtime_dir,
+                    ControlRequest::PackageInstall { server_id },
+                    package_timeout,
+                    json,
+                )
+                .await
+            }
+        },
         Command::Harness(_) => unreachable!("harness commands return before runtime resolution"),
         Command::Mcp => {
             run_stdio_bridge(&runtime_dir, MCP_BRIDGE_CONNECT_TIMEOUT).await?;
             Ok(CliExitCode::Success)
         }
     }
+}
+
+async fn execute_auth_login(
+    runtime_dir: &Path,
+    server_id: String,
+    timeout: Duration,
+    json_output: bool,
+) -> Result<CliExitCode, RuntimeError> {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .map_err(|_| auth_login_error("the OAuth loopback listener could not be opened"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|_| auth_login_error("the OAuth loopback address is unavailable"))?;
+    let redirect_uri = format!("http://{address}/callback");
+    let started = send_control(
+        runtime_dir,
+        &ControlRequest::AuthStart {
+            server_id: server_id.clone(),
+            redirect_uri: redirect_uri.clone(),
+        },
+        timeout,
+    )
+    .await?;
+    let started: AuthLoginStartResult = serde_json::from_value(started)
+        .map_err(|_| auth_login_error("the daemon returned an invalid OAuth response"))?;
+    writeln!(
+        std::io::stderr(),
+        "Open this URL in your browser:\n{}",
+        started.authorization_url
+    )
+    .map_err(|_| output_error())?;
+
+    let (mut stream, callback_url) =
+        receive_oauth_callback(listener, &redirect_uri, timeout).await?;
+    let completed = send_control(
+        runtime_dir,
+        &ControlRequest::AuthComplete {
+            server_id,
+            callback_url,
+        },
+        timeout,
+    )
+    .await;
+    let success = completed.is_ok();
+    write_oauth_browser_response(&mut stream, success).await;
+    let completed = completed?;
+    write_value(&completed, json_output)?;
+    Ok(CliExitCode::Success)
+}
+
+async fn receive_oauth_callback(
+    listener: tokio::net::TcpListener,
+    redirect_uri: &str,
+    timeout: Duration,
+) -> Result<(tokio::net::TcpStream, String), RuntimeError> {
+    receive_oauth_callback_with_request_timeout(
+        listener,
+        redirect_uri,
+        timeout,
+        AUTH_CALLBACK_REQUEST_TIMEOUT,
+    )
+    .await
+}
+
+async fn receive_oauth_callback_with_request_timeout(
+    listener: tokio::net::TcpListener,
+    redirect_uri: &str,
+    timeout: Duration,
+    request_timeout: Duration,
+) -> Result<(tokio::net::TcpStream, String), RuntimeError> {
+    tokio::time::timeout(timeout, async move {
+        loop {
+            let (mut stream, peer) = listener.accept().await.map_err(|_| {
+                auth_login_error("the OAuth loopback callback could not be accepted")
+            })?;
+            if !peer.ip().is_loopback() {
+                write_oauth_browser_response(&mut stream, false).await;
+                continue;
+            }
+            let target =
+                match tokio::time::timeout(request_timeout, read_oauth_request_target(&mut stream))
+                    .await
+                {
+                    Ok(Ok(Some(target))) => target,
+                    Ok(Ok(None) | Err(_)) | Err(_) => {
+                        write_oauth_browser_response(&mut stream, false).await;
+                        continue;
+                    }
+                };
+            if !target.starts_with("/callback?") {
+                write_oauth_browser_response(&mut stream, false).await;
+                continue;
+            }
+            return Ok((
+                stream,
+                format!("{redirect_uri}{suffix}", suffix = &target[9..]),
+            ));
+        }
+    })
+    .await
+    .map_err(|_| auth_login_error("the OAuth loopback callback timed out"))?
+}
+
+async fn read_oauth_request_target(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<Option<String>, RuntimeError> {
+    use tokio::io::AsyncReadExt as _;
+
+    const MAX_REQUEST_BYTES: usize = 16 * 1024;
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while request.len() < MAX_REQUEST_BYTES {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|_| auth_login_error("the OAuth loopback request could not be read"))?;
+        if read == 0 {
+            return Ok(None);
+        }
+        request.extend_from_slice(&chunk[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    if request.len() >= MAX_REQUEST_BYTES {
+        return Ok(None);
+    }
+    let request = std::str::from_utf8(&request).ok();
+    let mut parts = request
+        .and_then(|request| request.lines().next())
+        .map(str::split_ascii_whitespace)
+        .into_iter()
+        .flatten();
+    let method = parts.next();
+    let target = parts.next();
+    let version = parts.next();
+    if method != Some("GET")
+        || !version.is_some_and(|version| version.starts_with("HTTP/"))
+        || parts.next().is_some()
+    {
+        return Ok(None);
+    }
+    Ok(target.map(str::to_owned))
+}
+
+async fn write_oauth_browser_response(stream: &mut tokio::net::TcpStream, success: bool) {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (status, body) = if success {
+        ("200 OK", "OAuth login completed. You may close this tab.")
+    } else {
+        (
+            "400 Bad Request",
+            "OAuth login failed. Return to the terminal for details.",
+        )
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+fn auth_login_error(message: &'static str) -> RuntimeError {
+    RuntimeError::new(RuntimeErrorCode::AuthFailed, "auth_login", message)
+}
+
+fn execute_service(
+    command: ServiceCommand,
+    runtime_dir: &Path,
+    runtime_dir_explicit: bool,
+    json_output: bool,
+) -> Result<CliExitCode, RuntimeError> {
+    let options = match &command {
+        ServiceCommand::Install(install) => &install.options,
+        ServiceCommand::Uninstall(options) | ServiceCommand::Status(options) => options,
+    };
+    let descriptor = service_descriptor(options, runtime_dir, runtime_dir_explicit)?;
+    let value = match command {
+        ServiceCommand::Install(install) => {
+            let result =
+                install_service(&descriptor, install.no_start).map_err(service_operation_error)?;
+            json!({
+                "installed": true,
+                "updated": result.artifact_updated,
+                "enabled": result.enabled,
+                "started": result.started,
+                "descriptor": service_path(&descriptor),
+            })
+        }
+        ServiceCommand::Uninstall(_) => {
+            let result = uninstall_service(&descriptor).map_err(service_operation_error)?;
+            json!({
+                "installed": false,
+                "removed": result.artifact_removed,
+                "descriptor": service_path(&descriptor),
+            })
+        }
+        ServiceCommand::Status(_) => {
+            let report = service_status(&descriptor).map_err(service_operation_error)?;
+            json!({
+                "artifact": service_artifact_status(&report.artifact),
+                "loaded": report.loaded,
+                "enabled": report.enabled,
+                "active": service_run_state(report.run_state),
+                "descriptor": service_path(&descriptor),
+            })
+        }
+    };
+    write_value(&value, json_output)?;
+    Ok(CliExitCode::Success)
+}
+
+fn service_descriptor(
+    options: &ServiceOptions,
+    runtime_dir: &Path,
+    runtime_dir_explicit: bool,
+) -> Result<ServiceDescriptor, RuntimeError> {
+    let executable = std::fs::canonicalize(std::env::current_exe().map_err(service_error)?)
+        .map_err(service_error)?;
+    let config_dir = std::fs::canonicalize(&options.config_dir).map_err(service_error)?;
+    let manager = match options.manager {
+        ServiceManager::Auto => native_service_manager()?,
+        ServiceManager::Systemd => ServiceManagerKind::Systemd,
+        ServiceManager::Launchd => ServiceManagerKind::Launchd,
+        ServiceManager::WindowsScm => ServiceManagerKind::WindowsScm,
+    };
+    let scope = match options.scope {
+        Some(mcp_host::cli::ServiceScope::User) => DescriptorScope::User,
+        Some(mcp_host::cli::ServiceScope::System) => DescriptorScope::System,
+        None if manager == ServiceManagerKind::WindowsScm => DescriptorScope::System,
+        None => DescriptorScope::User,
+    };
+    let runtime_dir = service_runtime_dir(manager, scope, runtime_dir, runtime_dir_explicit)?;
+    std::fs::create_dir_all(&runtime_dir).map_err(service_error)?;
+    let runtime_dir = std::fs::canonicalize(runtime_dir).map_err(service_error)?;
+    let base = BaseDirs::new();
+    let descriptor_dir = match (manager, scope) {
+        (ServiceManagerKind::Systemd, DescriptorScope::User) => std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| base.as_ref().map(|base| base.home_dir().join(".config")))
+            .ok_or_else(|| service_error("could not determine the user config directory"))?
+            .join("systemd/user"),
+        (ServiceManagerKind::Systemd, DescriptorScope::System) => {
+            PathBuf::from("/etc/systemd/system")
+        }
+        (ServiceManagerKind::Launchd, DescriptorScope::User) => base
+            .as_ref()
+            .ok_or_else(|| service_error("could not determine the user home directory"))?
+            .home_dir()
+            .join("Library/LaunchAgents"),
+        (ServiceManagerKind::Launchd, DescriptorScope::System) => {
+            PathBuf::from("/Library/LaunchDaemons")
+        }
+        (ServiceManagerKind::WindowsScm, _) => runtime_dir.clone(),
+    };
+    render_descriptor(
+        manager,
+        &ServiceInstallOptions {
+            scope,
+            name: options.name.clone(),
+            description: "Dynamic MCP Host daemon".to_owned(),
+            executable,
+            config_dir,
+            runtime_dir,
+            descriptor_dir,
+        },
+    )
+    .map_err(service_error)
+}
+
+fn service_runtime_dir(
+    manager: ServiceManagerKind,
+    scope: DescriptorScope,
+    runtime_dir: &Path,
+    runtime_dir_explicit: bool,
+) -> Result<PathBuf, RuntimeError> {
+    #[cfg(windows)]
+    if manager == ServiceManagerKind::WindowsScm
+        && scope == DescriptorScope::System
+        && !runtime_dir_explicit
+    {
+        return std::env::var_os("ProgramData")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .map(|path| path.join("Dynamic MCP/runtime"))
+            .ok_or_else(|| service_error("could not determine the ProgramData directory"));
+    }
+    let _ = (manager, scope, runtime_dir_explicit);
+    Ok(runtime_dir.to_path_buf())
+}
+
+fn native_service_manager() -> Result<ServiceManagerKind, RuntimeError> {
+    #[cfg(target_os = "linux")]
+    return Ok(ServiceManagerKind::Systemd);
+    #[cfg(target_os = "macos")]
+    return Ok(ServiceManagerKind::Launchd);
+    #[cfg(windows)]
+    return Ok(ServiceManagerKind::WindowsScm);
+    #[allow(unreachable_code)]
+    Err(service_error(
+        "this platform has no supported service manager",
+    ))
+}
+
+fn service_path(descriptor: &ServiceDescriptor) -> Value {
+    match &descriptor.artifact {
+        ServiceArtifact::File { path, .. } => json!(path),
+        ServiceArtifact::WindowsScm(spec) => json!(spec.service_name),
+    }
+}
+
+fn service_artifact_status(status: &ServiceStatus) -> &'static str {
+    match status {
+        ServiceStatus::NotInstalled => "not_installed",
+        ServiceStatus::Installed { drifted: false } => "installed",
+        ServiceStatus::Installed { drifted: true } => "drifted",
+        ServiceStatus::Foreign => "foreign",
+    }
+}
+
+const fn service_run_state(state: ServiceRunState) -> &'static str {
+    match state {
+        ServiceRunState::Running => "running",
+        ServiceRunState::Stopped => "stopped",
+        ServiceRunState::Failed => "failed",
+        ServiceRunState::Unknown => "unknown",
+    }
+}
+
+fn service_error(error: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::InvalidArguments,
+        "daemon_service",
+        error.to_string(),
+    )
+}
+
+fn service_operation_error(error: ServiceOperationError) -> RuntimeError {
+    let code = match error.kind {
+        ServiceOperationErrorKind::InvalidArguments => RuntimeErrorCode::InvalidArguments,
+        ServiceOperationErrorKind::Foreign => RuntimeErrorCode::ServiceForeign,
+        ServiceOperationErrorKind::PermissionDenied => RuntimeErrorCode::ServicePermissionDenied,
+        ServiceOperationErrorKind::ManagerUnavailable => {
+            RuntimeErrorCode::ServiceManagerUnavailable
+        }
+        ServiceOperationErrorKind::Failed => RuntimeErrorCode::ServiceOperationFailed,
+    };
+    RuntimeError::new(code, "daemon_service", error.message)
 }
 
 async fn execute_control(
@@ -260,6 +710,30 @@ async fn read_call_arguments(call: &Call) -> Result<Value, RuntimeError> {
     }
 }
 
+async fn read_skill_inputs(run: &SkillRunArgs) -> Result<Value, RuntimeError> {
+    let inputs = match (&run.input, &run.input_file) {
+        (Some(inputs), None) => inputs.as_bytes().to_vec(),
+        (None, Some(path)) if path == Path::new("-") => {
+            let mut inputs = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::stdin(), &mut inputs)
+                .await
+                .map_err(|_| skill_arguments_error())?;
+            inputs
+        }
+        (None, Some(path)) => tokio::fs::read(path)
+            .await
+            .map_err(|_| skill_arguments_error())?,
+        (None, None) => b"{}".to_vec(),
+        (Some(_), Some(_)) => return Err(skill_arguments_error()),
+    };
+    let value: Value = serde_json::from_slice(&inputs).map_err(|_| skill_arguments_error())?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(skill_arguments_error())
+    }
+}
+
 async fn read_batch_calls(batch: &Batch) -> Result<Vec<BatchToolCall>, RuntimeError> {
     let calls = match (&batch.calls, &batch.calls_file) {
         (Some(calls), None) => calls.as_bytes().to_vec(),
@@ -309,6 +783,20 @@ fn batch_exit_code(response: &BatchToolCallResponse) -> CliExitCode {
     CliExitCode::Success
 }
 
+fn skill_exit_code(response: &SkillRunResult) -> CliExitCode {
+    if response.status == SkillRunStatus::Ok {
+        return CliExitCode::Success;
+    }
+    if response
+        .failure
+        .as_ref()
+        .is_some_and(|failure| failure.error.code == RuntimeErrorCode::SkillUpstreamError)
+    {
+        return CliExitCode::UpstreamToolError;
+    }
+    CliExitCode::RuntimeFailure
+}
+
 fn invalid_arguments_error() -> RuntimeError {
     RuntimeError::new(
         RuntimeErrorCode::InvalidArguments,
@@ -330,6 +818,22 @@ fn batch_response_error() -> RuntimeError {
         RuntimeErrorCode::ProtocolError,
         "call_tools",
         "daemon returned an invalid batch response",
+    )
+}
+
+fn skill_arguments_error() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::SkillInputInvalid,
+        "skill_inputs",
+        "skill inputs must be a JSON object",
+    )
+}
+
+fn skill_response_error() -> RuntimeError {
+    RuntimeError::new(
+        RuntimeErrorCode::ProtocolError,
+        "skill_run",
+        "daemon returned an invalid skill response",
     )
 }
 
@@ -381,11 +885,14 @@ fn process_exit_code(exit_code: CliExitCode) -> std::process::ExitCode {
 mod tests {
     use mcp_host_core::{
         BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult, RuntimeError,
-        RuntimeErrorCode, ToolCallResult,
+        RuntimeErrorCode, SkillRunFailure, SkillRunResult, SkillRunStatus, ToolCallResult,
     };
     use serde_json::json;
 
-    use super::{BatchToolCall, CliExitCode, Duration, batch_control_timeout, batch_exit_code};
+    use super::{
+        BatchToolCall, CliExitCode, Duration, batch_control_timeout, batch_exit_code,
+        read_oauth_request_target, receive_oauth_callback_with_request_timeout, skill_exit_code,
+    };
 
     #[test]
     fn batch_exit_code_reflects_item_errors_and_upstream_tool_errors() {
@@ -412,6 +919,80 @@ mod tests {
         assert_eq!(batch_exit_code(&runtime_error), CliExitCode::RuntimeFailure);
     }
 
+    #[tokio::test]
+    async fn oauth_loopback_parser_accepts_only_a_get_request_target() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let reader = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("callback should connect");
+            read_oauth_request_target(&mut stream).await
+        });
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("callback client should connect");
+        client
+            .write_all(
+                format!(
+                    "GET /callback?code=sentinel&state=csrf HTTP/1.1\r\nHost: {address}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("callback request should write");
+
+        assert_eq!(
+            reader
+                .await
+                .expect("reader task should join")
+                .expect("request should parse")
+                .as_deref(),
+            Some("/callback?code=sentinel&state=csrf")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_loopback_skips_a_stalled_connection() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let redirect_uri = format!("http://{address}/callback");
+        let receiver = tokio::spawn(async move {
+            receive_oauth_callback_with_request_timeout(
+                listener,
+                &redirect_uri,
+                Duration::from_secs(1),
+                Duration::from_millis(20),
+            )
+            .await
+        });
+        let _stalled = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("stalled client should connect");
+        let mut callback = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("callback client should connect");
+        callback
+            .write_all(b"GET /callback?code=sentinel&state=csrf HTTP/1.1\r\n\r\n")
+            .await
+            .expect("callback request should write");
+
+        let (_, callback_url) = receiver
+            .await
+            .expect("receiver task should join")
+            .expect("valid callback should be accepted");
+        assert_eq!(
+            callback_url,
+            format!("http://{address}/callback?code=sentinel&state=csrf")
+        );
+    }
+
     #[test]
     fn batch_control_timeout_covers_the_longest_item() {
         let calls = [BatchToolCall {
@@ -427,6 +1008,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skill_exit_code_distinguishes_upstream_and_runtime_failures() {
+        let success = skill_response(SkillRunStatus::Ok, None);
+        let upstream = skill_response(
+            SkillRunStatus::Error,
+            Some(RuntimeErrorCode::SkillUpstreamError),
+        );
+        let runtime = skill_response(SkillRunStatus::Error, Some(RuntimeErrorCode::PolicyDenied));
+
+        assert_eq!(skill_exit_code(&success), CliExitCode::Success);
+        assert_eq!(skill_exit_code(&upstream), CliExitCode::UpstreamToolError);
+        assert_eq!(skill_exit_code(&runtime), CliExitCode::RuntimeFailure);
+    }
+
     fn response(outcome: BatchToolCallOutcome) -> BatchToolCallResponse {
         BatchToolCallResponse {
             results: vec![BatchToolCallResult {
@@ -434,6 +1029,23 @@ mod tests {
                 tool_name: "echo".to_owned(),
                 outcome,
             }],
+        }
+    }
+
+    fn skill_response(status: SkillRunStatus, code: Option<RuntimeErrorCode>) -> SkillRunResult {
+        SkillRunResult {
+            skill_id: "skill".to_owned(),
+            status,
+            steps_completed: 0,
+            steps_total: 1,
+            results: Vec::new(),
+            failure: code.map(|code| SkillRunFailure {
+                step_index: 0,
+                step_id: "step".to_owned(),
+                server_id: "server".to_owned(),
+                tool_name: "tool".to_owned(),
+                error: RuntimeError::new(code, "skill_run", "safe failure"),
+            }),
         }
     }
 }

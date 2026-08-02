@@ -19,10 +19,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::RuntimeManager;
+use crate::{
+    RuntimeManager,
+    envelope::{HostToolEnvelope, HostToolErrorEnvelope, RoutedToolResult, output_schema},
+};
 
 const SERVER_DESCRIPTION: &str = "A long-running MCP runtime and process manager that presents one stable MCP server to AI clients while managing manifest-defined MCP servers as downstream clients.";
-const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers.\n2. Call inspect_server to review a server's public configuration and current state.\n3. Call connect_server before using a disconnected server.\n4. Call list_tools after connecting to discover that server's available tools.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.\n6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.";
+const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers.\n2. Call inspect_server to review a server's public configuration and current state.\n3. Call connect_server before using a disconnected server.\n4. Call list_tools after connecting to discover that server's available tools.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.\n6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.\n7. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.\n8. For call_tool and successful call_tools items, also inspect the downstream isError field.";
 
 /// Shared process state owned by the daemon hosting inbound MCP sessions.
 pub struct HostRuntimeState {
@@ -123,10 +126,15 @@ impl HostMcpServer {
     /// Creates the fixed MCP server adapter over a managed downstream runtime.
     #[must_use]
     pub fn new(runtime: Arc<RuntimeManager>, state: Arc<HostRuntimeState>) -> Self {
+        let mut tool_router = Self::tool_router();
+        let schema = output_schema();
+        for route in tool_router.map.values_mut() {
+            route.attr.output_schema = Some(Arc::clone(&schema));
+        }
         Self {
             runtime,
             state,
-            tool_router: Self::tool_router(),
+            tool_router,
         }
     }
 
@@ -210,6 +218,7 @@ impl HostMcpServer {
     async fn list_servers(&self) -> Result<CallToolResult, ErrorData> {
         let servers = self.runtime.list_servers().await;
         structured_result(
+            "list_servers",
             json!({ "servers": servers }),
             "Listed downstream MCP servers.",
         )
@@ -227,7 +236,11 @@ impl HostMcpServer {
             .inspect_server(&server_id)
             .await
             .map_err(runtime_error)?;
-        structured_result(inspection, "Inspected downstream MCP server.")
+        structured_result(
+            "inspect_server",
+            inspection,
+            "Inspected downstream MCP server.",
+        )
     }
 
     #[tool(description = "Connect to a downstream MCP server and discover its tools.")]
@@ -240,7 +253,11 @@ impl HostMcpServer {
             .connect_server(&server_id)
             .await
             .map_err(runtime_error)?;
-        structured_result(connection, "Connected to downstream MCP server.")
+        structured_result(
+            "connect_server",
+            connection,
+            "Connected to downstream MCP server.",
+        )
     }
 
     #[tool(description = "Disconnect from a downstream MCP server.")]
@@ -253,7 +270,11 @@ impl HostMcpServer {
             .disconnect_server(&server_id)
             .await
             .map_err(runtime_error)?;
-        structured_result(disconnection, "Disconnected from downstream MCP server.")
+        structured_result(
+            "disconnect_server",
+            disconnection,
+            "Disconnected from downstream MCP server.",
+        )
     }
 
     #[tool(
@@ -268,7 +289,7 @@ impl HostMcpServer {
             .list_tools(&server_id, refresh)
             .await
             .map_err(runtime_error)?;
-        structured_result(tools, "Listed downstream MCP tools.")
+        structured_result("list_tools", tools, "Listed downstream MCP tools.")
     }
 
     #[tool(description = "Call a discovered tool on a connected downstream MCP server.")]
@@ -286,7 +307,7 @@ impl HostMcpServer {
             .call_tool(&server_id, &tool_name, Value::Object(arguments), timeout_ms)
             .await
             .map_err(runtime_error)?;
-        decode_downstream_result(result.into_value())
+        routed_downstream_result(server_id, tool_name, result.into_value())
     }
 
     #[tool(
@@ -314,13 +335,13 @@ impl HostMcpServer {
             "Completed {} concurrent downstream tool calls.",
             response.results.len()
         );
-        structured_result(response, &text)
+        structured_result("call_tools", response, &text)
     }
 
     #[tool(description = "Return Dynamic MCP Host process and downstream runtime status.")]
     async fn status(&self) -> Result<CallToolResult, ErrorData> {
         let status = self.state.status(&self.runtime).await;
-        structured_result(status, "Retrieved Dynamic MCP Host status.")
+        structured_result("status", status, "Retrieved Dynamic MCP Host status.")
     }
 
     #[tool(
@@ -335,7 +356,7 @@ impl HostMcpServer {
             .refresh_server(&server_id)
             .await
             .map_err(runtime_error)?;
-        structured_result(tools, "Refreshed downstream MCP tools.")
+        structured_result("refresh_server", tools, "Refreshed downstream MCP tools.")
     }
 }
 
@@ -352,13 +373,38 @@ impl ServerHandler for HostMcpServer {
     }
 }
 
-fn structured_result<T>(value: T, text: &str) -> Result<CallToolResult, ErrorData>
+fn structured_result<T>(
+    operation: &'static str,
+    value: T,
+    text: &str,
+) -> Result<CallToolResult, ErrorData>
 where
     T: Serialize,
 {
-    let value = serde_json::to_value(value).map_err(|_| serialization_error())?;
+    let value = serde_json::to_value(HostToolEnvelope::success(operation, value))
+        .map_err(|_| serialization_error())?;
     let mut result = CallToolResult::structured(value);
     result.content = vec![ContentBlock::text(text.to_owned())];
+    Ok(result)
+}
+
+fn routed_downstream_result(
+    server_id: String,
+    tool_name: String,
+    value: Value,
+) -> Result<CallToolResult, ErrorData> {
+    let mut result = decode_downstream_result(value.clone())?;
+    result.structured_content = Some(
+        serde_json::to_value(HostToolEnvelope::success(
+            "call_tool",
+            RoutedToolResult {
+                server_id,
+                tool_name,
+                result: value,
+            },
+        ))
+        .map_err(|_| serialization_error())?,
+    );
     Ok(result)
 }
 
@@ -367,7 +413,7 @@ fn decode_downstream_result(value: Value) -> Result<CallToolResult, ErrorData> {
 }
 
 fn runtime_error(error: RuntimeError) -> ErrorData {
-    let data = match serde_json::to_value(&error) {
+    let data = match serde_json::to_value(HostToolErrorEnvelope::from(&error)) {
         Ok(data) => data,
         Err(_) => return serialization_error(),
     };
@@ -412,7 +458,7 @@ mod tests {
 
     use super::{
         HostMcpServer, HostRuntimeState, RuntimeError, RuntimeErrorCode, RuntimeManager,
-        decode_downstream_result, runtime_error,
+        routed_downstream_result, runtime_error,
     };
 
     #[test]
@@ -442,6 +488,25 @@ mod tests {
             serde_json::to_value(info.capabilities).expect("server capabilities should serialize");
 
         assert_eq!(capabilities, json!({ "tools": {} }));
+    }
+
+    #[test]
+    fn every_fixed_tool_advertises_the_stable_envelope_schema() {
+        let server = server();
+
+        for tool in server.tool_router.list_all() {
+            let schema = tool
+                .output_schema
+                .as_ref()
+                .expect("every fixed tool should advertise an output schema");
+            let required = schema["required"]
+                .as_array()
+                .expect("required should be an array");
+            assert!(required.contains(&json!("schema_version")));
+            assert!(required.contains(&json!("operation")));
+            assert!(required.contains(&json!("ok")));
+            assert!(required.contains(&json!("data")));
+        }
     }
 
     #[test]
@@ -491,26 +556,46 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(
-            error.data.as_ref().and_then(|data| data["code"].as_str()),
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data["error"]["code"].as_str()),
             Some("SERVER_NOT_FOUND")
+        );
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data["ok"].as_bool()),
+            Some(false)
         );
     }
 
     #[test]
-    fn downstream_tool_error_result_is_returned_without_conversion() {
+    fn downstream_tool_result_preserves_llm_fields_and_nests_the_machine_result() {
         let value = json!({
             "content": [{ "type": "text", "text": "upstream error" }],
             "structuredContent": { "answer": false },
             "isError": true,
-            "_meta": { "trace": "preserved" }
+            "_meta": { "trace": "preserved" },
+            "resultType": "complete"
         });
 
-        let result = decode_downstream_result(value).expect("downstream result should decode");
+        let result =
+            routed_downstream_result("fixture".to_owned(), "fail".to_owned(), value.clone())
+                .expect("downstream result should decode");
         let preserved = serde_json::to_value(result).expect("result should serialize");
 
         assert_eq!(preserved["isError"], json!(true));
-        assert_eq!(preserved["structuredContent"], json!({ "answer": false }));
         assert_eq!(preserved["_meta"], json!({ "trace": "preserved" }));
+        assert_eq!(preserved["resultType"], "complete");
+        assert_eq!(
+            preserved["structuredContent"]["schema_version"],
+            "dynamic-mcp/v1"
+        );
+        assert_eq!(
+            preserved["structuredContent"]["data"]["server_id"],
+            "fixture"
+        );
+        assert_eq!(preserved["structuredContent"]["data"]["tool_name"], "fail");
+        assert_eq!(preserved["structuredContent"]["data"]["result"], value);
     }
 
     #[tokio::test]

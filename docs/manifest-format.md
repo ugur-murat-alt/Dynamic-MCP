@@ -12,6 +12,8 @@ opens an MCP connection.
 - Subdirectories are not traversed.
 - Hidden files, symlinks, unsupported extensions, and editor files beginning
   with `.`, `~`, or `#` are ignored.
+- `policy.toml` and `*.skill.toml` belong to separate loaders and are not parsed
+  as server manifests.
 - Files are loaded in a deterministic filename order.
 - An empty directory produces an empty manifest list.
 - A missing or unreadable directory returns a typed error.
@@ -89,8 +91,47 @@ Authorization = "${REMOTE_AUTHORIZATION}"
   values.
 
 V1 passes these resolved static headers to RMCP's Streamable HTTP client on
-every request. OAuth, browser login, token refresh, and authorization discovery
-are intentionally not implemented.
+every request.
+
+### OAuth Authorization
+
+An HTTP server can instead use authorization-code PKCE:
+
+```toml
+id = "remote"
+name = "Remote"
+description = "OAuth-protected MCP server"
+
+[auth]
+client_id = "pre-registered-public-client"
+scopes = ["read", "write"]
+
+[transport]
+type = "http"
+url = "https://example.com/mcp"
+```
+
+`client_id` is optional. When omitted, RMCP uses Dynamic Client Registration if
+the authorization server advertises a registration endpoint. `scopes` is also
+optional; an empty list lets RMCP select scopes from protected-resource and
+authorization-server metadata. Empty client IDs, empty or duplicate scopes,
+OAuth on a stdio transport, and combining `[auth]` with an `Authorization`
+static header are rejected.
+
+Pre-registered clients must allow an RFC 8252 loopback redirect with a dynamic
+port. Dynamic registration receives the exact redirect URI selected by the CLI.
+
+Run `mcp-host auth login <SERVER_ID>` before connecting. The CLI binds an
+ephemeral `127.0.0.1` callback and uses PKCE S256. Tokens are stored below the
+platform's persistent local-data directory in an `auth/` subtree; on Unix the
+directory is mode `0700`, files are mode `0600`, and updates use an atomic
+same-directory replace. The file name includes a fingerprint of server ID,
+resource URL, client ID, and scopes so independent registrations cannot collide.
+PKCE verifier and callback state remain memory-only. RMCP refreshes an expiring
+access token when a refresh token is available. Credential files are bound to
+the exact resource URL and are ignored after that URL changes.
+If the platform cannot resolve a persistent local-data directory, non-OAuth
+servers remain available but OAuth login/connect fail with `AUTH_FAILED`.
 
 ## Environment References
 

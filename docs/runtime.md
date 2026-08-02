@@ -75,6 +75,18 @@ A downstream response produces `status: "success"` and is preserved unchanged,
 including `content`, `structuredContent`, `isError`, and `_meta`. In particular,
 `isError: true` is a successful upstream transport response.
 
+## Runtime Skill Invocation
+
+`run_skill` clones one immutable definition from the atomically loaded skill
+catalog and executes its 1-16 steps in order. Unlike batch invocation it is
+strictly sequential and fail-fast. A skill-level `skill_run` policy check occurs
+before execution; every step then calls the public `call_tool` path and therefore
+rechecks normal server/tool call policy. A downstream `isError: true`, runtime
+error, or unresolved template path stops the run and returns ordered partial
+results. Runs are synchronous and are not retained in daemon state. See
+[Runtime Skills](runtime-skills.md) for the file, template, result, and CLI
+contracts.
+
 ## Stdio Upstream
 
 For a `stdio` manifest, the manager creates an RMCP `TokioChildProcess` from a
@@ -100,12 +112,22 @@ also drops/cleans the incomplete transport and waits for its stderr task.
 For an `http` manifest, the manager creates RMCP
 `StreamableHttpClientTransport` with the configured URI and static manifest
 headers. Header names and values are validated at connection time, and values
-remain secret-safe outside that boundary. HTTP has no OAuth acquisition,
-refresh, browser flow, or other authentication state in V1.
+remain secret-safe outside that boundary.
 
-Both `http://` and `https://` endpoints are supported. v0.1.2 enables RMCP's
-native-TLS reqwest client; an offline regression test verifies that an HTTPS
-endpoint opens a TCP connection and begins a TLS ClientHello.
+When the manifest has `[auth]`, connect first loads credentials bound to the
+resource URL and fails with `AUTH_REQUIRED` before opening the MCP transport when
+none exist. The transport wraps reqwest with RMCP `AuthClient`, which injects a
+Bearer token for every MCP request and refreshes it when expiry is less than 30
+seconds away. Authorization-code PKCE discovery, dynamic registration or a
+pre-registered client ID, callback exchange, status, and logout are exposed only
+through control IPC and the CLI. PKCE state remains in memory; tokens are
+atomically persisted below `RuntimeSettings::auth_root`. The daemon points that
+root at the platform's durable local-data directory rather than ephemeral IPC
+runtime storage.
+
+Both `http://` and `https://` endpoints are supported through RMCP's native-TLS
+reqwest client; an offline regression test verifies that an HTTPS endpoint
+opens a TCP connection and begins a TLS ClientHello.
 
 The same RMCP initialization and initial `list_all_tools` sequence applies to
 HTTP. HTTP sessions have no child PID or stderr tail.
@@ -135,7 +157,8 @@ usable when the transport remains open.
 
 | Event | V1 behavior |
 | --- | --- |
-| Downstream process or transport closes unexpectedly | Desired-connected runtime becomes `failed`; cache becomes stale; no auto-restart. |
+| Downstream process or transport closes unexpectedly | Desired-connected runtime becomes `failed`; cache becomes stale; configured reconnect policy applies capped exponential backoff with jitter. |
+| OAuth credentials are absent or refresh requires authorization | Connect fails with `AUTH_REQUIRED`; automatic reconnect stops until login is completed. |
 | Explicit reconnect from `failed` | Starts a new session and clears the prior safe error on start. |
 | Disconnect during start/initialize | Cancels the connect flight, waits for cleanup, ends stopped. |
 | Unknown, disabled, or disconnected server | Stable typed runtime error; no connection attempt is made except explicit connect. |
@@ -164,6 +187,6 @@ Implementation anchors: [`RuntimeManager`](../crates/mcp-host-mcp/src/runtime.rs
 The normative protocol sources are the stable [MCP 2025-11-25 lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle),
 [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools),
 and [transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
-documents. SDK behavior is tied to the exact [RMCP 2.2.0 API](https://docs.rs/rmcp/2.2.0/rmcp/)
-and [2.2.0 release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.2.0),
+documents. SDK behavior is tied to the exact [RMCP 3.0.0-beta.2 API](https://docs.rs/rmcp/3.0.0-beta.2/rmcp/)
+and [3.0.0-beta.2 release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.0.0-beta.2),
 not `latest` documentation.

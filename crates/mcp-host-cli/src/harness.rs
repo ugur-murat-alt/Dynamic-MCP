@@ -9,7 +9,11 @@ use mcp_host_core::{RuntimeError, RuntimeErrorCode};
 use serde_json::{Value, json};
 use tokio::{process::Command, time::timeout};
 
-use crate::cli::{ClaudeScope, HarnessInstall, HarnessTarget};
+use crate::{
+    cli::{ClaudeScope, HarnessInstall, HarnessTarget},
+    harness_config::{ConfigVerification, verify_claude, verify_opencode},
+    harness_files::install_harness_files,
+};
 
 const HARNESS_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const ERROR_DETAIL_LIMIT: usize = 2_048;
@@ -18,19 +22,35 @@ pub async fn install_harnesses(
     install: HarnessInstall,
     runtime_dir: Option<&Path>,
 ) -> Result<Value, RuntimeError> {
-    let executable = canonical_executable()?;
     let runtime_dir = absolute_runtime_dir(runtime_dir)?;
-    let runtime_dir = runtime_dir.as_deref();
+    let bridge = bridge_arguments(&install, runtime_dir.as_deref())?;
+    let command = bridge_command_json(&bridge);
     let mut installed = Vec::new();
 
     if matches!(install.target, HarnessTarget::OpenCode | HarnessTarget::All) {
-        let arguments = opencode_arguments(&install.name, &executable, runtime_dir);
-        run_harness_command("opencode", &arguments, true).await?;
+        let before = verify_opencode(&install.name, &command).map_err(harness_error)?;
+        let updated = !before.exact;
+        if updated {
+            let arguments = opencode_arguments(&install.name, &bridge);
+            run_harness_command("opencode", &arguments, true).await?;
+        }
+        let verification = require_exact(
+            verify_opencode(&install.name, &command).map_err(harness_error)?,
+            "opencode",
+        )?;
+        let files = install_harness_files(HarnessTarget::OpenCode).map_err(harness_error)?;
         installed.push(json!({
             "harness": "opencode",
             "name": install.name,
             "scope": "global",
-            "command": bridge_command_json(&executable, runtime_dir),
+            "command": command,
+            "configUpdated": updated,
+            "verified": true,
+            "configPath": verification.path,
+            "skillPath": files.skill_path,
+            "skillUpdated": files.skill_updated,
+            "instructionPath": files.instruction_path,
+            "instructionUpdated": files.instruction_updated,
         }));
     }
 
@@ -38,19 +58,35 @@ pub async fn install_harnesses(
         install.target,
         HarnessTarget::ClaudeCode | HarnessTarget::All
     ) {
-        let remove_arguments = claude_remove_arguments(&install.name, install.scope);
-        // Claude Code rejects duplicate names. Removing only the requested scope makes
-        // repeated installs deterministic; a missing entry is expected on first install.
-        run_harness_command("claude", &remove_arguments, false).await?;
+        let before =
+            verify_claude(&install.name, install.scope, &command).map_err(harness_error)?;
+        let updated = !before.exact;
+        if updated {
+            let remove_arguments = claude_remove_arguments(&install.name, install.scope);
+            // Claude Code rejects duplicate names. Removing only the requested scope makes
+            // repair deterministic; a missing entry is expected on first install.
+            run_harness_command("claude", &remove_arguments, false).await?;
 
-        let arguments =
-            claude_add_arguments(&install.name, install.scope, &executable, runtime_dir);
-        run_harness_command("claude", &arguments, true).await?;
+            let arguments = claude_add_arguments(&install.name, install.scope, &bridge);
+            run_harness_command("claude", &arguments, true).await?;
+        }
+        let verification = require_exact(
+            verify_claude(&install.name, install.scope, &command).map_err(harness_error)?,
+            "claude",
+        )?;
+        let files = install_harness_files(HarnessTarget::ClaudeCode).map_err(harness_error)?;
         installed.push(json!({
             "harness": "claude-code",
             "name": install.name,
             "scope": install.scope.as_str(),
-            "command": bridge_command_json(&executable, runtime_dir),
+            "command": command,
+            "configUpdated": updated,
+            "verified": true,
+            "configPath": verification.path,
+            "skillPath": files.skill_path,
+            "skillUpdated": files.skill_updated,
+            "instructionPath": files.instruction_path,
+            "instructionUpdated": files.instruction_updated,
         }));
     }
 
@@ -78,23 +114,38 @@ fn absolute_runtime_dir(runtime_dir: Option<&Path>) -> Result<Option<PathBuf>, R
         })
 }
 
-fn canonical_executable() -> Result<PathBuf, RuntimeError> {
-    let executable = std::env::current_exe().map_err(|error| {
+fn canonical_executable(executable: &Path) -> Result<PathBuf, RuntimeError> {
+    std::fs::canonicalize(executable).map_err(|error| {
         harness_error(format!(
-            "could not locate the current mcp-host executable: {error}"
-        ))
-    })?;
-
-    std::fs::canonicalize(&executable).map_err(|error| {
-        harness_error(format!(
-            "could not resolve executable path {}: {error}",
+            "could not resolve bridge executable path {}: {error}",
             executable.display()
         ))
     })
 }
 
-fn bridge_arguments(executable: &Path, runtime_dir: Option<&Path>) -> Vec<OsString> {
-    let mut arguments = vec![executable.as_os_str().to_owned()];
+fn bridge_arguments(
+    install: &HarnessInstall,
+    runtime_dir: Option<&Path>,
+) -> Result<Vec<OsString>, RuntimeError> {
+    if let Some(executable) = &install.bridge_command {
+        if runtime_dir.is_some() {
+            return Err(harness_error(
+                "--runtime-dir cannot be combined with --bridge-command; pass wrapper arguments with --bridge-arg",
+            ));
+        }
+        let executable = canonical_executable(executable)?;
+        let mut arguments = vec![executable.into_os_string()];
+        arguments.extend(install.bridge_arg.iter().map(OsString::from));
+        return Ok(arguments);
+    }
+
+    let current = std::env::current_exe().map_err(|error| {
+        harness_error(format!(
+            "could not locate the current mcp-host executable: {error}"
+        ))
+    })?;
+    let executable = canonical_executable(&current)?;
+    let mut arguments = vec![executable.into_os_string()];
     if let Some(runtime_dir) = runtime_dir {
         arguments.extend([
             OsString::from("--runtime-dir"),
@@ -102,21 +153,16 @@ fn bridge_arguments(executable: &Path, runtime_dir: Option<&Path>) -> Vec<OsStri
         ]);
     }
     arguments.push(OsString::from("mcp"));
-    arguments
+    Ok(arguments)
 }
 
-fn opencode_arguments(name: &str, executable: &Path, runtime_dir: Option<&Path>) -> Vec<OsString> {
+fn opencode_arguments(name: &str, bridge: &[OsString]) -> Vec<OsString> {
     let mut arguments = os_strings(["mcp", "add", name, "--"]);
-    arguments.extend(bridge_arguments(executable, runtime_dir));
+    arguments.extend_from_slice(bridge);
     arguments
 }
 
-fn claude_add_arguments(
-    name: &str,
-    scope: ClaudeScope,
-    executable: &Path,
-    runtime_dir: Option<&Path>,
-) -> Vec<OsString> {
+fn claude_add_arguments(name: &str, scope: ClaudeScope, bridge: &[OsString]) -> Vec<OsString> {
     let mut arguments = os_strings([
         "mcp",
         "add",
@@ -127,7 +173,7 @@ fn claude_add_arguments(
         name,
         "--",
     ]);
-    arguments.extend(bridge_arguments(executable, runtime_dir));
+    arguments.extend_from_slice(bridge);
     arguments
 }
 
@@ -204,11 +250,28 @@ fn command_error_detail(stderr: &[u8], stdout: &[u8]) -> String {
     }
 }
 
-fn bridge_command_json(executable: &Path, runtime_dir: Option<&Path>) -> Vec<String> {
-    bridge_arguments(executable, runtime_dir)
-        .into_iter()
+fn bridge_command_json(bridge: &[OsString]) -> Vec<String> {
+    bridge
+        .iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect()
+}
+
+fn require_exact(
+    verification: ConfigVerification,
+    harness: &str,
+) -> Result<ConfigVerification, RuntimeError> {
+    if verification.exact {
+        return Ok(verification);
+    }
+    Err(harness_error(format!(
+        "{harness} configuration verification failed at {}: {}",
+        verification.path.display(),
+        verification
+            .reason
+            .as_deref()
+            .unwrap_or("configuration differs")
+    )))
 }
 
 fn harness_error(message: impl Into<String>) -> RuntimeError {
@@ -228,11 +291,13 @@ mod tests {
 
     #[test]
     fn builds_opencode_arguments_without_shell_joining() {
-        let arguments = opencode_arguments(
-            "dynamic-mcp",
-            Path::new("/path with spaces/mcp-host"),
-            Some(Path::new("/runtime path")),
-        );
+        let bridge = os_strings([
+            "/path with spaces/mcp-host",
+            "--runtime-dir",
+            "/runtime path",
+            "mcp",
+        ]);
+        let arguments = opencode_arguments("dynamic-mcp", &bridge);
 
         assert_eq!(
             strings(arguments),
@@ -251,12 +316,8 @@ mod tests {
 
     #[test]
     fn builds_claude_arguments_with_scope_and_transport() {
-        let arguments = claude_add_arguments(
-            "dynamic-mcp",
-            ClaudeScope::Project,
-            Path::new("/bin/mcp-host"),
-            None,
-        );
+        let bridge = os_strings(["/bin/mcp-host", "mcp"]);
+        let arguments = claude_add_arguments("dynamic-mcp", ClaudeScope::Project, &bridge);
 
         assert_eq!(
             strings(arguments),
@@ -301,5 +362,28 @@ mod tests {
 
         assert!(runtime_dir.is_absolute());
         assert!(runtime_dir.ends_with("relative runtime"));
+    }
+
+    #[test]
+    fn custom_bridge_command_uses_only_explicit_arguments() {
+        let bridge_file = tempfile::NamedTempFile::new().expect("temporary bridge");
+        let install = HarnessInstall {
+            target: HarnessTarget::OpenCode,
+            name: "dynamic-mcp".to_owned(),
+            scope: ClaudeScope::User,
+            bridge_command: Some(bridge_file.path().to_owned()),
+            bridge_arg: vec!["--custom".to_owned(), "argument with spaces".to_owned()],
+        };
+
+        let bridge = bridge_arguments(&install, None).expect("custom bridge");
+        assert_eq!(
+            strings(bridge),
+            [
+                bridge_file.path().to_string_lossy().into_owned(),
+                "--custom".to_owned(),
+                "argument with spaces".to_owned(),
+            ]
+        );
+        assert!(bridge_arguments(&install, Some(Path::new("runtime"))).is_err());
     }
 }

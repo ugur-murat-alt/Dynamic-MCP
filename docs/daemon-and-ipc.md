@@ -30,8 +30,11 @@ startup order is:
 6. Write `daemon.json`, then mark both services ready and start their accept
    loops.
 
-The daemon does not fork, daemonize, or start in the background. A caller that
-needs a background daemon must manage the process itself.
+The foreground `daemon run` command does not fork or daemonize. `daemon service
+install` can instead register it with systemd, launchd, or native Windows SCM.
+On Windows the hidden service entrypoint reports SCM readiness only after both
+IPC listeners are bound, and SCM STOP/SHUTDOWN controls feed the same root
+cancellation token used by control-plane shutdown.
 
 `daemon.json` is written only after both listeners bind successfully. It is a
 secret-free JSON record containing `pid`, `started_at_unix_ms`,
@@ -64,7 +67,7 @@ behavior on Windows.
 
 ## Control Protocol
 
-Control protocol version remains `1` in v0.1.2. Each connection carries exactly
+Control protocol version remains `1` in v0.2.0. Each connection carries exactly
 one request and one response, then is closed. The payload is JSON framed as:
 
 ```text
@@ -100,11 +103,24 @@ and `error`.
 
 Control request `type` values are `ping`, `status`, `list_servers`,
 `inspect_server`, `connect_server`, `disconnect_server`, `list_tools`,
-`call_tool`, `call_tools`, `refresh_server`, and `shutdown`. `call_tools` carries
+`call_tool`, `call_tools`, `refresh_server`, `package_install`, `auth_start`,
+`auth_complete`, `auth_status`, `auth_logout`, `skill_list`, `skill_run`, and
+`shutdown`. `call_tools` carries
 `calls`, an array of 1 through 32 `{server_id, tool_name, arguments?,
 timeout_ms?}` items. Its control deadline is the greater of the base control
 timeout and the longest explicit or effective item timeout plus five seconds.
 The request and response each remain subject to the 8 MiB frame limit.
+
+OAuth remains control-plane-only and does not add Host MCP tools. `auth_start`
+accepts a daemon-validated IPv4 loopback redirect URI and returns an
+authorization URL. `auth_complete` accepts the matching callback URL; its code
+and state are treated as credentials and are not logged. Credential persistence
+uses the platform's persistent local-data `auth/` subtree, while
+authorization-flow state is memory-only.
+
+`skill_list` and `skill_run` are also control-only. Skill execution is
+synchronous and stateless; the response carries ordered partial results on step
+failure. It remains subject to the normal 8 MiB control frame limit.
 
 Protocol v1 is not a forward-compatible feature negotiation mechanism: a
 v0.1.0 daemon does not recognize `call_tools`. Upgrade both CLI and daemon to

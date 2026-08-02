@@ -2,6 +2,12 @@
 
 Date: 2026-07-25
 
+> Update (2026-07-27): Dynamic MCP Host v0.2.0 intentionally supersedes this
+> snapshot's RMCP 2.2.0 recommendation by pinning `3.0.0-beta.2` after a focused
+> migration and regression pass. The wire protocol remains explicitly pinned to
+> stable MCP `2025-11-25`; draft protocol and optional RMCP 3 feature families
+> remain disabled. The original findings below are retained as dated research.
+
 ## Decision Summary
 
 - Target the stable MCP specification revision `2025-11-25`.

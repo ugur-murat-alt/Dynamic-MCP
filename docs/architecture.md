@@ -26,9 +26,9 @@ MCP client -- stdio -- `mcp-host mcp` raw byte bridge -- MCP IPC |
 ```
 
 The CLI is short-lived; connection and child-process state belong to the
-daemon. A daemon starts from one manifest snapshot and reads no configuration
-again while it is running. Changing a manifest requires a daemon restart; V1
-has no file watcher or registry hot reload.
+daemon. A daemon starts from one validated manifest/policy snapshot, watches the
+configuration directory, debounces changes for 500 ms, and atomically publishes
+only a fully valid replacement snapshot. Invalid reloads retain the prior state.
 
 ## Crate Boundaries
 
@@ -77,9 +77,11 @@ Control IPC is a request/response protocol:
 - The control protocol version is `1`; clients verify both version and request
   ID before accepting a response.
 - Control operations are `ping`, `status`, server listing/inspection,
-  connect/disconnect, tool list/refresh, single call, batch `call_tools`, and
-  shutdown. The protocol version remains `1`; v0.1.0 daemons do not understand
-  batch calls, so the CLI and daemon must be upgraded together.
+  connect/disconnect, tool list/refresh, single call, batch `call_tools`,
+  explicit package install, OAuth start/complete/status/logout, runtime skill
+  list/run, and shutdown.
+  The protocol version remains `1`; older daemons do not understand additive
+  request variants, so the CLI and daemon must be upgraded together.
 
 The MCP IPC listener is deliberately different. It is an unframed bidirectional
 byte stream. `mcp-host mcp` connects stdin/stdout directly to that stream with
@@ -105,10 +107,11 @@ daemon's shared `RuntimeManager`. Its tool list is fixed and deterministic:
 
 `call_tool` requires `server_id`, `tool_name`, and object-valued `arguments`.
 `call_tools` accepts 1 through 32 already-connected call items and returns
-`structuredContent.results`. It runs them concurrently while retaining input
-order; individual runtime failures stay in that result array. Both operations
-preserve valid downstream results without semantic conversion. There is no
-dynamic injection of discovered tools into the host tool list and no
+`structuredContent.data.results` inside the stable `dynamic-mcp/v1` envelope.
+It runs them concurrently while retaining input order; individual runtime
+failures stay in that result array. `call_tool` preserves downstream LLM-facing
+fields and nests the complete raw result under `data.result`. There is no dynamic
+injection of discovered tools into the host tool list and no
 `tools/list_changed` publication. CLI commands dispatch the same manager
 operations through control IPC.
 
@@ -117,8 +120,9 @@ operations through control IPC.
 Every registered server has a desired connection (`connected` or
 `disconnected`) and an observed lifecycle state (`registered`, `starting`,
 `initializing`, `connected`, `disconnected`, `stopped`, or `failed`). A failed
-transport remains desired-connected until an explicit reconnect or disconnect;
-V1 does not automatically restart it.
+transport remains desired-connected until an explicit disconnect. When enabled
+in the manifest, automatic recovery performs at most the configured
+number of capped exponential-backoff attempts with deterministic jitter.
 
 Runtime state is isolated per server. A server-local Tokio `Mutex` protects only
 short lifecycle state transitions and extraction/replacement of a session; no
@@ -137,20 +141,30 @@ desired-connected session as failed and marks its cached tools stale.
 ## Protocol And SDK Baselines
 
 V1 targets the stable [MCP 2025-11-25 lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle), [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), and [transports](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) specifications.
-The workspace pins [`rmcp = 2.2.0`](../crates/mcp-host-mcp/Cargo.toml) exactly;
-the corresponding [versioned API documentation](https://docs.rs/rmcp/2.2.0/rmcp/),
-[crate metadata](https://crates.io/crates/rmcp/2.2.0), and
-[release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v2.2.0)
+The workspace pins [`rmcp = 3.0.0-beta.2`](../crates/mcp-host-mcp/Cargo.toml)
+exactly; the corresponding [versioned API documentation](https://docs.rs/rmcp/3.0.0-beta.2/rmcp/),
+[crate metadata](https://crates.io/crates/rmcp/3.0.0-beta.2), and
+[release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.0.0-beta.2)
 are the SDK sources for this implementation.
+
+The beta SDK does not change the wire baseline: `ClientEvents::get_info`
+explicitly advertises stable MCP `2025-11-25`. RMCP OAuth support is enabled for
+authorization-code PKCE, while draft `2026-07-28` protocol, tasks, lifecycle
+extensions, and elicitation remain disabled.
 
 ## Explicit V1 Scope
 
-V1 intentionally has no registry hot reload, implicit connection on tool list
-or call, automatic reconnect/retry, OAuth flow, authentication broker,
-permissions, marketplace/installation, plugins, skills, dynamic host tools, or
-downstream semantic routing. HTTP supports only manifest-configured static
-headers; it does not obtain or refresh OAuth credentials.
+V1 intentionally has no implicit connection on tool list or call, marketplace,
+plugins, dynamic host tools, or downstream semantic routing. Registry/policy/
+skill hot reload, bounded reconnect, policy enforcement, explicit package
+installation, HTTP OAuth PKCE, and linear runtime skill execution are
+control-plane features; none changes the fixed nine-tool Host MCP surface.
 
-The remaining accepted, non-blocking limitation is that child-process cleanup
-does not manage descendant process groups or Windows Job Objects. It does not
-change the implemented daemon, transport, lifecycle, or protocol contract.
+Native service management is also outside the Host MCP surface. systemd and
+launchd are invoked with shell-free argv after managed-artifact checks. Windows
+SCM uses a safe service API wrapper, LocalSystem auto-start registration, a
+managed display-name marker, and a hidden service dispatcher that converts SCM
+STOP/SHUTDOWN into daemon root cancellation.
+
+Stdio children are isolated through Unix process groups or Windows Job Objects.
+Native runtime behavior still requires platform-specific verification.

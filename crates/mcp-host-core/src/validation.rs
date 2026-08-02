@@ -6,16 +6,21 @@ use url::{ParseError, Url};
 use crate::{
     environment::{EnvironmentAccessError, EnvironmentProvider},
     manifest::{
-        ResolvedServerManifest, ResolvedTransportConfig, SecretValue, ServerId, ServerIdError,
-        ServerManifest, TransportConfig,
+        OAuthConfig, PackageProvider, ProvisionConfig, ReconnectConfig, ResolvedServerManifest,
+        ResolvedTransportConfig, SecretValue, ServerId, ServerIdError, ServerManifest,
+        TransportConfig,
     },
 };
 
 pub(crate) struct ValidatedManifest {
+    manifest_version: u32,
     id: ServerId,
     name: String,
     description: String,
     enabled: bool,
+    reconnect: ReconnectConfig,
+    provision: Option<ProvisionConfig>,
+    auth: Option<OAuthConfig>,
     transport: ValidatedTransportConfig,
 }
 
@@ -35,6 +40,31 @@ enum ValidatedTransportConfig {
 pub(crate) fn validate_manifest(
     manifest: &ServerManifest,
 ) -> Result<ValidatedManifest, ManifestValidationError> {
+    if manifest.manifest_version != 1 {
+        return Err(ManifestValidationError::UnsupportedManifestVersion {
+            version: manifest.manifest_version,
+        });
+    }
+    if manifest.reconnect.enabled
+        && (manifest.reconnect.max_retries == 0
+            || manifest.reconnect.initial_backoff_ms == 0
+            || manifest.reconnect.max_backoff_ms < manifest.reconnect.initial_backoff_ms)
+    {
+        return Err(ManifestValidationError::InvalidReconnectConfiguration);
+    }
+    if let Some(provision) = &manifest.provision {
+        validate_provision(provision)?;
+        if !matches!(&manifest.transport, TransportConfig::Stdio { .. }) {
+            return Err(ManifestValidationError::InvalidProvisionConfiguration);
+        }
+    }
+    if let Some(auth) = &manifest.auth {
+        validate_auth(auth)?;
+        if !matches!(&manifest.transport, TransportConfig::Http { .. }) {
+            return Err(ManifestValidationError::InvalidAuthConfiguration);
+        }
+    }
+
     let id = ServerId::parse(&manifest.id).map_err(|source| {
         ManifestValidationError::InvalidServerId {
             field: "id",
@@ -111,6 +141,13 @@ pub(crate) fn validate_manifest(
                     });
                 }
             }
+            if manifest.auth.is_some()
+                && headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+            {
+                return Err(ManifestValidationError::InvalidAuthConfiguration);
+            }
 
             ValidatedTransportConfig::Http {
                 url,
@@ -120,10 +157,14 @@ pub(crate) fn validate_manifest(
     };
 
     Ok(ValidatedManifest {
+        manifest_version: manifest.manifest_version,
         id,
         name: manifest.name.clone(),
         description: manifest.description.clone(),
         enabled: manifest.enabled,
+        reconnect: manifest.reconnect.clone(),
+        provision: manifest.provision.clone(),
+        auth: manifest.auth.clone(),
         transport,
     })
 }
@@ -167,10 +208,14 @@ pub(crate) fn resolve_manifest<E: EnvironmentProvider>(
     };
 
     Ok(ResolvedServerManifest {
+        manifest_version: manifest.manifest_version,
         id: manifest.id,
         name: manifest.name,
         description: manifest.description,
         enabled: manifest.enabled,
+        reconnect: manifest.reconnect,
+        provision: manifest.provision,
+        auth: manifest.auth,
         transport,
     })
 }
@@ -256,8 +301,50 @@ fn is_valid_header_name(name: &str) -> bool {
         })
 }
 
+fn validate_provision(provision: &ProvisionConfig) -> Result<(), ManifestValidationError> {
+    let exact_version = !provision.version.trim().is_empty()
+        && !matches!(provision.version.trim(), "latest" | "*" | "x" | "X")
+        && !provision.version.chars().any(char::is_whitespace);
+    let binary = Path::new(&provision.binary);
+    if provision.package.trim().is_empty()
+        || !exact_version
+        || provision.binary.trim().is_empty()
+        || binary.components().count() != 1
+    {
+        return Err(ManifestValidationError::InvalidProvisionConfiguration);
+    }
+    if provision.allow_scripts && provision.provider != PackageProvider::Npm {
+        return Err(ManifestValidationError::InvalidProvisionConfiguration);
+    }
+    Ok(())
+}
+
+fn validate_auth(auth: &OAuthConfig) -> Result<(), ManifestValidationError> {
+    if auth
+        .client_id
+        .as_deref()
+        .is_some_and(|client_id| client_id.trim().is_empty())
+        || auth.scopes.iter().any(|scope| scope.trim().is_empty())
+    {
+        return Err(ManifestValidationError::InvalidAuthConfiguration);
+    }
+    let mut scopes = std::collections::HashSet::new();
+    if auth.scopes.iter().any(|scope| !scopes.insert(scope)) {
+        return Err(ManifestValidationError::InvalidAuthConfiguration);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ManifestValidationError {
+    #[error("unsupported manifest version {version}")]
+    UnsupportedManifestVersion { version: u32 },
+    #[error("invalid reconnect configuration")]
+    InvalidReconnectConfiguration,
+    #[error("invalid provision configuration")]
+    InvalidProvisionConfiguration,
+    #[error("invalid OAuth configuration")]
+    InvalidAuthConfiguration,
     #[error("field `{field}` contains an invalid server ID: {source}")]
     InvalidServerId {
         field: &'static str,
@@ -303,7 +390,7 @@ mod tests {
 
     use crate::{
         environment::{EnvironmentAccessError, EnvironmentProvider},
-        manifest::{ResolvedTransportConfig, ServerManifest},
+        manifest::{PackageProvider, ProvisionConfig, ResolvedTransportConfig, ServerManifest},
     };
 
     use super::{
@@ -343,6 +430,40 @@ mod tests {
             validate_manifest(&empty_command),
             Err(ManifestValidationError::InvalidTransportConfiguration { ref field, .. })
                 if field == "transport.command"
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_version_and_invalid_reconnect_settings() {
+        let mut manifest = stdio_manifest("server", "Server", "command", None);
+        manifest.manifest_version = 2;
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestValidationError::UnsupportedManifestVersion { version: 2 })
+        ));
+
+        manifest.manifest_version = 1;
+        manifest.reconnect.enabled = true;
+        manifest.reconnect.max_retries = 0;
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestValidationError::InvalidReconnectConfiguration)
+        ));
+    }
+
+    #[test]
+    fn rejects_unpinned_or_unsafe_package_configuration() {
+        let mut manifest = stdio_manifest("server", "Server", "command", None);
+        manifest.provision = Some(ProvisionConfig {
+            provider: PackageProvider::Cargo,
+            package: "example".to_owned(),
+            version: "latest".to_owned(),
+            binary: "../example".to_owned(),
+            allow_scripts: false,
+        });
+        assert!(matches!(
+            validate_manifest(&manifest),
+            Err(ManifestValidationError::InvalidProvisionConfiguration)
         ));
     }
 
@@ -417,6 +538,64 @@ mod tests {
             validate_manifest(&manifest),
             Err(ManifestValidationError::InvalidTransportConfiguration { ref field, .. })
                 if field == "transport.headers."
+        ));
+    }
+
+    #[test]
+    fn validates_oauth_only_for_http_without_an_authorization_header() {
+        let stdio: ServerManifest = toml::from_str(
+            r#"
+                id = "local"
+                name = "Local"
+                description = "Test"
+                [auth]
+                scopes = ["read"]
+                [transport]
+                type = "stdio"
+                command = "server"
+            "#,
+        )
+        .expect("manifest should parse");
+        assert!(matches!(
+            validate_manifest(&stdio),
+            Err(ManifestValidationError::InvalidAuthConfiguration)
+        ));
+
+        let duplicate_scopes: ServerManifest = toml::from_str(
+            r#"
+                id = "remote"
+                name = "Remote"
+                description = "Test"
+                [auth]
+                scopes = ["read", "read"]
+                [transport]
+                type = "http"
+                url = "https://example.com/mcp"
+            "#,
+        )
+        .expect("manifest should parse");
+        assert!(matches!(
+            validate_manifest(&duplicate_scopes),
+            Err(ManifestValidationError::InvalidAuthConfiguration)
+        ));
+
+        let authorization_header: ServerManifest = toml::from_str(
+            r#"
+                id = "remote"
+                name = "Remote"
+                description = "Test"
+                [auth]
+                [transport]
+                type = "http"
+                url = "https://example.com/mcp"
+                [transport.headers]
+                authorization = "Bearer static"
+            "#,
+        )
+        .expect("manifest should parse");
+        assert!(matches!(
+            validate_manifest(&authorization_header),
+            Err(ManifestValidationError::InvalidAuthConfiguration)
         ));
     }
 

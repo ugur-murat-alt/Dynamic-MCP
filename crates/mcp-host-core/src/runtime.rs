@@ -33,6 +33,23 @@ pub enum RuntimeErrorCode {
     DaemonNotRunning,
     DaemonShuttingDown,
     ShutdownFailed,
+    PolicyDenied,
+    PackageNotConfigured,
+    PackageInstallFailed,
+    AuthNotConfigured,
+    AuthRequired,
+    AuthInProgress,
+    AuthFailed,
+    SkillNotFound,
+    SkillInvalid,
+    SkillInputInvalid,
+    SkillTemplateError,
+    SkillUpstreamError,
+    SkillOutputTooLarge,
+    ServiceForeign,
+    ServicePermissionDenied,
+    ServiceManagerUnavailable,
+    ServiceOperationFailed,
 }
 
 impl RuntimeErrorCode {
@@ -61,6 +78,23 @@ impl RuntimeErrorCode {
             Self::DaemonNotRunning => "DAEMON_NOT_RUNNING",
             Self::DaemonShuttingDown => "DAEMON_SHUTTING_DOWN",
             Self::ShutdownFailed => "SHUTDOWN_FAILED",
+            Self::PolicyDenied => "POLICY_DENIED",
+            Self::PackageNotConfigured => "PACKAGE_NOT_CONFIGURED",
+            Self::PackageInstallFailed => "PACKAGE_INSTALL_FAILED",
+            Self::AuthNotConfigured => "AUTH_NOT_CONFIGURED",
+            Self::AuthRequired => "AUTH_REQUIRED",
+            Self::AuthInProgress => "AUTH_IN_PROGRESS",
+            Self::AuthFailed => "AUTH_FAILED",
+            Self::SkillNotFound => "SKILL_NOT_FOUND",
+            Self::SkillInvalid => "SKILL_INVALID",
+            Self::SkillInputInvalid => "SKILL_INPUT_INVALID",
+            Self::SkillTemplateError => "SKILL_TEMPLATE_ERROR",
+            Self::SkillUpstreamError => "SKILL_UPSTREAM_ERROR",
+            Self::SkillOutputTooLarge => "SKILL_OUTPUT_TOO_LARGE",
+            Self::ServiceForeign => "SERVICE_FOREIGN",
+            Self::ServicePermissionDenied => "SERVICE_PERMISSION_DENIED",
+            Self::ServiceManagerUnavailable => "SERVICE_MANAGER_UNAVAILABLE",
+            Self::ServiceOperationFailed => "SERVICE_OPERATION_FAILED",
         }
     }
 }
@@ -147,7 +181,6 @@ pub struct ToolDefinition {
     pub input_schema: Value,
     pub output_schema: Option<Value>,
     pub annotations: Option<Value>,
-    pub execution: Option<Value>,
     pub icons: Option<Value>,
     pub meta: Option<Value>,
 }
@@ -207,6 +240,30 @@ pub struct DisconnectResult {
     pub server_id: String,
     pub state: LifecycleState,
     pub disconnected_at_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageInstallResult {
+    pub server_id: String,
+    pub provider: String,
+    pub package: String,
+    pub version: String,
+    pub binary_path: String,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthLoginStartResult {
+    pub server_id: String,
+    pub authorization_url: String,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusResult {
+    pub server_id: String,
+    pub authenticated: bool,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +332,41 @@ pub struct BatchToolCallResponse {
     pub results: Vec<BatchToolCallResult>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillRunStatus {
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillStepResult {
+    pub step_id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub result: ToolCallResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRunFailure {
+    pub step_index: u64,
+    pub step_id: String,
+    pub server_id: String,
+    pub tool_name: String,
+    pub error: RuntimeError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRunResult {
+    pub skill_id: String,
+    pub status: SkillRunStatus,
+    pub steps_completed: u64,
+    pub steps_total: u64,
+    pub results: Vec<SkillStepResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<SkillRunFailure>,
+}
+
 fn default_tool_arguments() -> Value {
     Value::Object(serde_json::Map::new())
 }
@@ -309,6 +401,29 @@ pub enum ControlRequest {
     },
     RefreshServer {
         server_id: String,
+    },
+    PackageInstall {
+        server_id: String,
+    },
+    AuthStart {
+        server_id: String,
+        redirect_uri: String,
+    },
+    AuthComplete {
+        server_id: String,
+        callback_url: String,
+    },
+    AuthStatus {
+        server_id: String,
+    },
+    AuthLogout {
+        server_id: String,
+    },
+    SkillList,
+    SkillRun {
+        skill_id: String,
+        #[serde(default = "default_tool_arguments")]
+        inputs: Value,
     },
     Shutdown,
 }
@@ -414,6 +529,41 @@ mod tests {
             (RuntimeErrorCode::DaemonNotRunning, "DAEMON_NOT_RUNNING"),
             (RuntimeErrorCode::DaemonShuttingDown, "DAEMON_SHUTTING_DOWN"),
             (RuntimeErrorCode::ShutdownFailed, "SHUTDOWN_FAILED"),
+            (RuntimeErrorCode::PolicyDenied, "POLICY_DENIED"),
+            (
+                RuntimeErrorCode::PackageNotConfigured,
+                "PACKAGE_NOT_CONFIGURED",
+            ),
+            (
+                RuntimeErrorCode::PackageInstallFailed,
+                "PACKAGE_INSTALL_FAILED",
+            ),
+            (RuntimeErrorCode::AuthNotConfigured, "AUTH_NOT_CONFIGURED"),
+            (RuntimeErrorCode::AuthRequired, "AUTH_REQUIRED"),
+            (RuntimeErrorCode::AuthInProgress, "AUTH_IN_PROGRESS"),
+            (RuntimeErrorCode::AuthFailed, "AUTH_FAILED"),
+            (RuntimeErrorCode::SkillNotFound, "SKILL_NOT_FOUND"),
+            (RuntimeErrorCode::SkillInvalid, "SKILL_INVALID"),
+            (RuntimeErrorCode::SkillInputInvalid, "SKILL_INPUT_INVALID"),
+            (RuntimeErrorCode::SkillTemplateError, "SKILL_TEMPLATE_ERROR"),
+            (RuntimeErrorCode::SkillUpstreamError, "SKILL_UPSTREAM_ERROR"),
+            (
+                RuntimeErrorCode::SkillOutputTooLarge,
+                "SKILL_OUTPUT_TOO_LARGE",
+            ),
+            (RuntimeErrorCode::ServiceForeign, "SERVICE_FOREIGN"),
+            (
+                RuntimeErrorCode::ServicePermissionDenied,
+                "SERVICE_PERMISSION_DENIED",
+            ),
+            (
+                RuntimeErrorCode::ServiceManagerUnavailable,
+                "SERVICE_MANAGER_UNAVAILABLE",
+            ),
+            (
+                RuntimeErrorCode::ServiceOperationFailed,
+                "SERVICE_OPERATION_FAILED",
+            ),
         ];
 
         for (code, wire_value) in cases {
@@ -554,6 +704,24 @@ mod tests {
 
         assert!(!format!("{error:?}").contains(secret_argument));
         assert!(!error.to_string().contains(secret_argument));
+    }
+
+    #[test]
+    fn oauth_errors_never_carry_callback_credentials() {
+        let callback_secret = "code=never-display-this&state=also-secret";
+        let _request = ControlRequest::AuthComplete {
+            server_id: "remote".to_owned(),
+            callback_url: format!("http://127.0.0.1:41000/callback?{callback_secret}"),
+        };
+        let error = RuntimeError::for_server(
+            RuntimeErrorCode::AuthFailed,
+            "auth_complete",
+            "remote",
+            "the OAuth operation failed",
+        );
+
+        assert!(!format!("{error:?}").contains(callback_secret));
+        assert!(!error.to_string().contains(callback_secret));
     }
 
     #[test]
