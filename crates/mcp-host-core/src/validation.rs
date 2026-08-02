@@ -302,14 +302,13 @@ fn is_valid_header_name(name: &str) -> bool {
 }
 
 fn validate_provision(provision: &ProvisionConfig) -> Result<(), ManifestValidationError> {
-    let exact_version = !provision.version.trim().is_empty()
-        && !matches!(provision.version.trim(), "latest" | "*" | "x" | "X")
+    let exact_version = is_safe_portable_component(&provision.version)
+        && !matches!(provision.version.as_str(), "latest" | "*" | "x" | "X")
         && !provision.version.chars().any(char::is_whitespace);
-    let binary = Path::new(&provision.binary);
-    if provision.package.trim().is_empty()
+    if !is_registry_package_identifier(provision.provider, &provision.package)
         || !exact_version
-        || provision.binary.trim().is_empty()
-        || binary.components().count() != 1
+        || !is_safe_portable_component(&provision.binary)
+        || Path::new(&provision.binary).components().count() != 1
     {
         return Err(ManifestValidationError::InvalidProvisionConfiguration);
     }
@@ -317,6 +316,68 @@ fn validate_provision(provision: &ProvisionConfig) -> Result<(), ManifestValidat
         return Err(ManifestValidationError::InvalidProvisionConfiguration);
     }
     Ok(())
+}
+
+fn is_safe_portable_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !matches!(value, "." | "..")
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+                )
+        })
+        && !value.ends_with('.')
+        && !is_windows_reserved_name(value)
+}
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or(value);
+    let basic_device = stem.eq_ignore_ascii_case("CON")
+        || stem.eq_ignore_ascii_case("PRN")
+        || stem.eq_ignore_ascii_case("AUX")
+        || stem.eq_ignore_ascii_case("NUL");
+    let numbered_device = stem.get(..3).is_some_and(|prefix| {
+        prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+    }) && stem.get(3..).is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    });
+    basic_device || numbered_device
+}
+
+fn is_registry_package_identifier(provider: PackageProvider, package: &str) -> bool {
+    match provider {
+        PackageProvider::Npm => package.strip_prefix('@').map_or_else(
+            || is_package_name_part(package, |byte| matches!(byte, b'.' | b'_' | b'-')),
+            |scoped| {
+                let Some((scope, name)) = scoped.split_once('/') else {
+                    return false;
+                };
+                !name.contains('/')
+                    && is_package_name_part(scope, |byte| matches!(byte, b'.' | b'_' | b'-'))
+                    && is_package_name_part(name, |byte| matches!(byte, b'.' | b'_' | b'-'))
+            },
+        ),
+        PackageProvider::Uv => {
+            is_package_name_part(package, |byte| matches!(byte, b'.' | b'_' | b'-'))
+        }
+        PackageProvider::Cargo => is_package_name_part(package, |byte| matches!(byte, b'_' | b'-')),
+    }
+}
+
+fn is_package_name_part(value: &str, allowed_punctuation: impl Fn(u8) -> bool) -> bool {
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .copied()
+            .all(|byte| byte.is_ascii_alphanumeric() || allowed_punctuation(byte))
 }
 
 fn validate_auth(auth: &OAuthConfig) -> Result<(), ManifestValidationError> {
@@ -465,6 +526,110 @@ mod tests {
             validate_manifest(&manifest),
             Err(ManifestValidationError::InvalidProvisionConfiguration)
         ));
+    }
+
+    #[test]
+    fn rejects_versions_that_are_not_safe_portable_components() {
+        for version in [
+            "../victim",
+            "../../tmp/victim",
+            "..\\victim",
+            "/tmp/victim",
+            "C:\\tmp\\victim",
+            ".",
+            "..",
+            " 1.2.3",
+            "1.2.3 ",
+            "1.2.3\u{7f}",
+            "CON",
+            "nul",
+            "COM1.txt",
+            "lPt9.version",
+            "COM¹",
+            "lpt³.txt",
+        ] {
+            let mut manifest = stdio_manifest("server", "Server", "command", None);
+            manifest.provision = Some(provision(PackageProvider::Cargo, "example", version));
+            assert!(
+                matches!(
+                    validate_manifest(&manifest),
+                    Err(ManifestValidationError::InvalidProvisionConfiguration)
+                ),
+                "unsafe version {version:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_exact_version_with_prerelease_and_build_metadata() {
+        let mut manifest = stdio_manifest("server", "Server", "command", None);
+        manifest.provision = Some(provision(
+            PackageProvider::Cargo,
+            "example",
+            "1.2.3-beta.1+build",
+        ));
+
+        validate_manifest(&manifest).expect("portable exact version should validate");
+    }
+
+    #[test]
+    fn rejects_local_vcs_url_and_option_like_package_specifications() {
+        for (provider, packages) in [
+            (
+                PackageProvider::Npm,
+                &[
+                    "../local",
+                    "file:../local",
+                    "git+https://example.test/repo",
+                    "--force",
+                ][..],
+            ),
+            (
+                PackageProvider::Uv,
+                &[
+                    "../local",
+                    "example @ https://example.test/pkg.whl",
+                    "git+https://example.test/repo",
+                    "--editable",
+                ][..],
+            ),
+            (
+                PackageProvider::Cargo,
+                &[
+                    "../local",
+                    "https://example.test/repo",
+                    "git+https://example.test/repo",
+                    "--path",
+                ][..],
+            ),
+        ] {
+            for package in packages {
+                let mut manifest = stdio_manifest("server", "Server", "command", None);
+                manifest.provision = Some(provision(provider, package, "1.2.3"));
+                assert!(
+                    matches!(
+                        validate_manifest(&manifest),
+                        Err(ManifestValidationError::InvalidProvisionConfiguration)
+                    ),
+                    "unsafe {provider:?} package {package:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_registry_package_identifiers_for_each_provider() {
+        for (provider, package) in [
+            (PackageProvider::Npm, "@example/mcp-server"),
+            (PackageProvider::Npm, "example-package"),
+            (PackageProvider::Uv, "example_package"),
+            (PackageProvider::Cargo, "example-package"),
+        ] {
+            let mut manifest = stdio_manifest("server", "Server", "command", None);
+            manifest.provision = Some(provision(provider, package, "1.2.3"));
+            validate_manifest(&manifest)
+                .unwrap_or_else(|error| panic!("valid {provider:?} package failed: {error}"));
+        }
     }
 
     #[test]
@@ -744,5 +909,15 @@ mod tests {
             "#
         ))
         .expect("test manifest should parse")
+    }
+
+    fn provision(provider: PackageProvider, package: &str, version: &str) -> ProvisionConfig {
+        ProvisionConfig {
+            provider,
+            package: package.to_owned(),
+            version: version.to_owned(),
+            binary: "example".to_owned(),
+            allow_scripts: false,
+        }
     }
 }

@@ -982,8 +982,7 @@ impl ServerRuntime {
                         self.registered.resolved_manifest().provision.as_ref(),
                     ) {
                         let installer = PackageInstaller::new(root.clone());
-                        let installed = installer.binary_path(&self.id, provision);
-                        if installed.is_file() {
+                        if let Some(installed) = installer.binary_path(&self.id, provision) {
                             command = installed.display().to_string();
                         }
                     }
