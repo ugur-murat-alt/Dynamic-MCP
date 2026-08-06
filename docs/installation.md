@@ -6,7 +6,7 @@ The POSIX installer supports Linux x86-64, macOS x86-64 and Apple Silicon, and
 Windows x86-64 from Git Bash, MSYS2, or Cygwin:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh | sh
 ```
 
 It resolves the latest GitHub Release, downloads the matching `.tar.gz` archive
@@ -21,7 +21,7 @@ Add `~/.local/bin` to `PATH` if the installer reports that it is missing.
 Install a pinned release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh \
   | sh -s -- --version v0.2.0
 ```
 
@@ -147,7 +147,7 @@ Run the installer again. It verifies and atomically replaces the executable at
 the same path, so existing harness registrations continue to work:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh | sh
 ```
 
 ## Release Assets

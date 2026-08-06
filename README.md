@@ -33,7 +33,7 @@ disabled.
 Install the latest GitHub Release to `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh | sh
 ```
 
 Register the transparent bridge with an AI coding harness:

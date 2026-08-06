@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${MCP_HOST_REPO:-ugur-murat-alt/Dynamic-MCP}"
+REPO="${MCP_HOST_REPO:-ugur-murat-alt/MCP-Host}"
 RELEASES_URL="${MCP_HOST_RELEASES_URL:-https://github.com/$REPO/releases}"
 VERSION="latest"
 INSTALL_DIR="${MCP_HOST_INSTALL_DIR:-$HOME/.local/bin}"
@@ -16,7 +16,7 @@ Usage:
 Options:
   --version <TAG>      Release tag to install, for example v0.2.0. Default: latest.
   --install-dir <DIR>  Destination directory. Default: $HOME/.local/bin.
-  --repo <OWNER/REPO>  GitHub repository. Default: ugur-murat-alt/Dynamic-MCP.
+  --repo <OWNER/REPO>  GitHub repository. Default: ugur-murat-alt/MCP-Host.
   -h, --help           Show this help.
 
 Environment:
@@ -24,8 +24,8 @@ Environment:
   MCP_HOST_INSTALL_DIR   Override the destination directory.
 
 Examples:
-  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh
-  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/Dynamic-MCP/main/install.sh | sh -s -- --version v0.2.0
+  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/ugur-murat-alt/MCP-Host/main/install.sh | sh -s -- --version v0.2.0
 EOF
 }
 
