@@ -155,6 +155,22 @@ impl EndpointSet {
                     Err(error) => return Err(error),
                 }
             }
+            if let Some(directory) = Path::new(&self.mcp).parent()
+                && let Ok(entries) = fs::read_dir(directory)
+            {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("mcp-") && name.ends_with(".sock") {
+                        match entry.file_type() {
+                            Ok(file_type) if file_type.is_socket() => {
+                                let _ = fs::remove_file(entry.path());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
 
         #[cfg(windows)]
@@ -262,6 +278,61 @@ pub async fn connect_mcp(
         .await
         .map_err(|_| ipc_unavailable_timeout())?
         .map_err(ipc_unavailable)
+}
+
+/// Connects a bridge to an arbitrary MCP endpoint path without control-plane framing.
+pub async fn connect_mcp_at(
+    endpoint: &Path,
+    request_timeout: Duration,
+) -> Result<Stream, RuntimeError> {
+    timeout(request_timeout, endpoints_connect_at(endpoint))
+        .await
+        .map_err(|_| ipc_unavailable_timeout())?
+        .map_err(ipc_unavailable)
+}
+
+/// Binds a listener for an arbitrary Unix socket path (or Windows pipe name).
+pub fn bind_socket_at(endpoint: &Path) -> io::Result<Listener> {
+    #[cfg(unix)]
+    {
+        use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
+
+        let name = endpoint.to_fs_name::<GenericFilePath>()?;
+        ListenerOptions::new()
+            .name(name)
+            .reclaim_name(false)
+            .mode(0o600)
+            .create_tokio()
+    }
+
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+
+        let label = endpoint.to_string_lossy();
+        let name = label.to_ns_name::<GenericNamespaced>()?;
+        ListenerOptions::new()
+            .name(name)
+            .reclaim_name(false)
+            .create_tokio()
+    }
+}
+
+async fn endpoints_connect_at(endpoint: &Path) -> io::Result<Stream> {
+    #[cfg(unix)]
+    {
+        let name = endpoint.to_fs_name::<GenericFilePath>()?;
+        interprocess::local_socket::tokio::Stream::connect(name).await
+    }
+
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{GenericNamespaced, ToNsName};
+
+        let label = endpoint.to_string_lossy();
+        let name = label.to_ns_name::<GenericNamespaced>()?;
+        interprocess::local_socket::tokio::Stream::connect(name).await
+    }
 }
 
 #[cfg(unix)]

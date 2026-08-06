@@ -119,13 +119,18 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
     assert_eq!(
         tools,
         [
+            "call_prompt",
             "call_tool",
             "call_tools",
             "connect_server",
             "disconnect_server",
+            "find_tool",
             "inspect_server",
+            "list_prompts",
+            "list_resources",
             "list_servers",
             "list_tools",
+            "read_resource",
             "refresh_server",
             "status",
         ]
@@ -455,6 +460,131 @@ async fn shutdown_closes_active_downstream_and_upstream_sessions() {
     ));
 }
 
+#[tokio::test]
+async fn connect_succeeds_quickly_when_opencode_serve_is_unreachable() {
+    let mut daemon = TestDaemon::start_with_opencode(Some("http://127.0.0.1:9")).await;
+    let started = Instant::now();
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "connect must not block on an unreachable opencode serve"
+    );
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_connects_register_the_proxy_exactly_once() {
+    let (mut events, url) = mock_opencode_server().await;
+    let mut daemon = TestDaemon::start_with_opencode(Some(&url)).await;
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+
+    let registered = tokio::time::timeout(PROCESS_TIMEOUT, events.registered())
+        .await
+        .expect("opencode serve should receive the registration")
+        .expect("registration event");
+    assert_eq!(registered["name"], "mcp-host-fixture");
+    let extra = tokio::time::timeout(Duration::from_millis(400), events.registered()).await;
+    assert!(extra.is_err(), "a repeated connect must not register again");
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test]
+async fn connected_server_exposes_a_native_tool_proxy_endpoint() {
+    let mut daemon = TestDaemon::start().await;
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+    let socket = daemon.runtime_dir.join("mcp-fixture.sock");
+    tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("proxy socket should appear after connect");
+
+    let proxy = proxy_client(&daemon, "fixture").await;
+    let tools = proxy
+        .list_all_tools()
+        .await
+        .expect("proxy tools should list");
+    let names: Vec<String> = tools
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect();
+    assert_eq!(names, ["add", "crash", "echo", "fail", "sleep"]);
+
+    let echo = proxy
+        .call_tool(
+            CallToolRequestParams::new("echo")
+                .with_arguments(Map::from_iter([("message".to_owned(), json!("proxy"))])),
+        )
+        .await
+        .expect("proxy echo should succeed");
+    assert_eq!(
+        echo.structured_content.as_ref().unwrap()["message"],
+        "proxy"
+    );
+
+    assert_success(&daemon.cli_json(&["disconnect", "fixture"]));
+    tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if !socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("proxy socket should disappear after disconnect");
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_linker_registers_and_unregisters_per_server_proxies() {
+    let (mut events, url) = mock_opencode_server().await;
+    let mut daemon = TestDaemon::start_with_opencode(Some(&url)).await;
+    assert_success(&daemon.cli_json(&["connect", "fixture"]));
+
+    let registered = tokio::time::timeout(PROCESS_TIMEOUT, events.registered())
+        .await
+        .expect("opencode serve should receive the registration")
+        .expect("registration event");
+    assert_eq!(registered["name"], "mcp-host-fixture");
+    assert_eq!(registered["config"]["type"], "local");
+    let command: Vec<String> = registered["config"]["command"]
+        .as_array()
+        .expect("command should be an array")
+        .iter()
+        .map(Value::as_str)
+        .map(|value| value.expect("command items are strings").to_owned())
+        .collect();
+    let proxy_socket = daemon
+        .runtime_dir
+        .join("mcp-fixture.sock")
+        .display()
+        .to_string();
+    assert!(
+        command
+            .windows(2)
+            .any(|pair| pair == ["--endpoint", &proxy_socket])
+    );
+
+    assert_success(&daemon.cli_json(&["disconnect", "fixture"]));
+    let name = tokio::time::timeout(PROCESS_TIMEOUT, events.disconnected())
+        .await
+        .expect("opencode serve should receive the disconnect")
+        .expect("disconnect event");
+    assert_eq!(name, "mcp-host-fixture");
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
 async fn host_client(
     daemon: &TestDaemon,
 ) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
@@ -485,6 +615,28 @@ async fn call_host_tool(
         .expect("host tool should succeed")
 }
 
+async fn proxy_client(
+    daemon: &TestDaemon,
+    server_id: &str,
+) -> rmcp::service::RunningService<rmcp::service::RoleClient, ()> {
+    let socket = daemon.runtime_dir.join(format!("mcp-{server_id}.sock"));
+    let transport = TokioChildProcess::new(tokio::process::Command::new(host_binary()).configure(
+        |command| {
+            command
+                .arg("mcp")
+                .arg("--runtime-dir")
+                .arg(&daemon.runtime_dir)
+                .arg("--endpoint")
+                .arg(&socket)
+                .stderr(Stdio::null());
+        },
+    ))
+    .expect("proxy bridge should start");
+    ().serve(transport)
+        .await
+        .expect("proxy MCP initialize should complete")
+}
+
 fn host_envelope<'a>(result: &'a CallToolResult, operation: &str) -> &'a Value {
     let envelope = result
         .structured_content
@@ -507,6 +659,10 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start() -> Self {
+        Self::start_with_opencode(None).await
+    }
+
+    async fn start_with_opencode(opencode_url: Option<&str>) -> Self {
         let root = tempfile::tempdir().expect("temporary directory should be created");
         let config_dir = root.path().join("config");
         let runtime_dir = root.path().join("runtime");
@@ -519,11 +675,16 @@ impl TestDaemon {
         );
         fs::write(config_dir.join("fixture.toml"), manifest)
             .expect("fixture manifest should be written");
-        let child = Command::new(host_binary())
+        let mut command = Command::new(host_binary());
+        command
             .args(["daemon", "run", "--config-dir"])
             .arg(&config_dir)
             .arg("--runtime-dir")
-            .arg(&runtime_dir)
+            .arg(&runtime_dir);
+        if let Some(url) = opencode_url {
+            command.arg("--opencode-serve-url").arg(url);
+        }
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -731,4 +892,64 @@ fn host_binary() -> &'static str {
 
 fn fixture_binary() -> &'static str {
     env!("CARGO_BIN_EXE_mcp-host-fixture-server")
+}
+
+/// Mock `opencode serve` /mcp runtime API recording registrations and
+/// disconnects through channels.
+struct MockOpencodeEvents {
+    registered_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    disconnected_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+impl MockOpencodeEvents {
+    async fn registered(&mut self) -> Option<Value> {
+        self.registered_rx.recv().await
+    }
+
+    async fn disconnected(&mut self) -> Option<String> {
+        self.disconnected_rx.recv().await
+    }
+}
+
+async fn mock_opencode_server() -> (MockOpencodeEvents, String) {
+    let (register_tx, register_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new()
+        .route(
+            "/mcp",
+            axum::routing::post({
+                let tx = register_tx.clone();
+                move |axum::extract::Json(body): axum::extract::Json<Value>| async move {
+                    let _ = tx.send(body);
+                    axum::Json(json!({}))
+                }
+            }),
+        )
+        .route(
+            "/mcp/{name}/disconnect",
+            axum::routing::post({
+                let tx = disconnect_tx.clone();
+                move |axum::extract::Path(name): axum::extract::Path<String>| async move {
+                    let _ = tx.send(name);
+                    axum::Json(json!({}))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock opencode server should bind");
+    let address = listener
+        .local_addr()
+        .expect("mock opencode server address")
+        .to_string();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (
+        MockOpencodeEvents {
+            registered_rx: register_rx,
+            disconnected_rx: disconnect_rx,
+        },
+        format!("http://{address}"),
+    )
 }

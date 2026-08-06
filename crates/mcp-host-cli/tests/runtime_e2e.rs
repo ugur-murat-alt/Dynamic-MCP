@@ -6,8 +6,9 @@ use std::{
 
 use futures_util::future::join_all;
 use mcp_host_core::{
-    BatchToolCall, BatchToolCallOutcome, LifecycleState, MAX_BATCH_CALLS, ManifestLoader, Policy,
-    ProcessEnvironment, RegistryBuilder, SkillCatalog, SkillRunStatus,
+    BatchToolCall, BatchToolCallOutcome, CallPolicy, LifecycleState, MAX_BATCH_CALLS,
+    ManifestLoader, Policy, ProcessEnvironment, RegistryBuilder, RuntimeErrorCode, SkillCatalog,
+    SkillRunStatus,
 };
 use mcp_host_mcp::{RuntimeManager, RuntimeSettings};
 use serde_json::json;
@@ -19,7 +20,7 @@ async fn real_stdio_initialize_discover_call_timeout_and_disconnect() {
     let manager = fixture.manager();
 
     let connected = manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should initialize");
     assert_eq!(connected.state, LifecycleState::Connected);
@@ -41,31 +42,55 @@ async fn real_stdio_initialize_discover_call_timeout_and_disconnect() {
     );
 
     let echo = manager
-        .call_tool("fixture", "echo", json!({"message": "hello"}), None)
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "hello"}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("echo should succeed");
     assert_eq!(echo.value()["structuredContent"]["message"], "hello");
 
     let add = manager
-        .call_tool("fixture", "add", json!({"a": 2, "b": 3}), None)
+        .call_tool(
+            "fixture",
+            "add",
+            json!({"a": 2, "b": 3}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("add should succeed");
     assert_eq!(add.value()["structuredContent"]["sum"], 5);
 
     let failure = manager
-        .call_tool("fixture", "fail", json!({}), None)
+        .call_tool("fixture", "fail", json!({}), None, CallPolicy::default())
         .await
         .expect("tool-level failure remains a valid MCP result");
     assert_eq!(failure.value()["isError"], true);
 
     let timeout = manager
-        .call_tool("fixture", "sleep", json!({"milliseconds": 1_000}), Some(30))
+        .call_tool(
+            "fixture",
+            "sleep",
+            json!({"milliseconds": 1_000}),
+            Some(30),
+            CallPolicy::default(),
+        )
         .await
         .expect_err("sleep should time out");
     assert_eq!(timeout.code.as_str(), "TOOL_CALL_TIMEOUT");
 
     let after_timeout = manager
-        .call_tool("fixture", "echo", json!({"message": "still-alive"}), None)
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "still-alive"}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("session should remain usable after cancellation");
     assert_eq!(
@@ -83,11 +108,217 @@ async fn real_stdio_initialize_discover_call_timeout_and_disconnect() {
 }
 
 #[tokio::test]
+async fn call_auto_connects_a_registered_but_disconnected_server() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+    manager
+        .disconnect_server("fixture")
+        .await
+        .expect("fixture should disconnect");
+
+    let result = manager
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "auto-connect"}),
+            None,
+            CallPolicy::default(),
+        )
+        .await
+        .expect("auto-connect should connect and call");
+    assert_eq!(
+        result.value()["structuredContent"]["message"],
+        "auto-connect"
+    );
+    let startup_after_first = fixture.startup_count();
+    assert_eq!(
+        manager
+            .call_tool(
+                "fixture",
+                "echo",
+                json!({"message": "second"}),
+                None,
+                CallPolicy::default(),
+            )
+            .await
+            .expect("second call should reuse the auto-connected session")
+            .value()["structuredContent"]["message"],
+        "second"
+    );
+    assert_eq!(
+        fixture.startup_count(),
+        startup_after_first,
+        "the second call must reuse the auto-connected session"
+    );
+}
+
+#[tokio::test]
+async fn call_with_auto_connect_disabled_requires_an_explicit_connection() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+    manager
+        .disconnect_server("fixture")
+        .await
+        .expect("fixture should disconnect");
+
+    let error = manager
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "blocked"}),
+            None,
+            CallPolicy {
+                auto_connect: false,
+                ..CallPolicy::default()
+            },
+        )
+        .await
+        .expect_err("auto-connect is disabled, the call must fail");
+    assert_eq!(error.code, RuntimeErrorCode::ServerNotConnected);
+}
+
+#[tokio::test]
+async fn misspelled_tool_reports_close_name_suggestions_after_refresh_retry() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+
+    let error = manager
+        .call_tool(
+            "fixture",
+            "ech",
+            json!({"message": "nope"}),
+            None,
+            CallPolicy::default(),
+        )
+        .await
+        .expect_err("misspelled tool must fail with suggestions");
+    assert_eq!(error.code, RuntimeErrorCode::ToolNotFound);
+    let suggestions = error
+        .suggestions
+        .as_ref()
+        .expect("suggestions should be attached");
+    assert_eq!(
+        suggestions
+            .iter()
+            .map(|suggestion| suggestion.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        ["echo"]
+    );
+    assert_eq!(suggestions[0].server_id, "fixture");
+}
+
+#[tokio::test]
+async fn max_output_tokens_truncates_oversized_results() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+
+    let result = manager
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "x".repeat(2_000)}),
+            None,
+            CallPolicy {
+                max_output_tokens: Some(8),
+                ..CallPolicy::default()
+            },
+        )
+        .await
+        .expect("echo should succeed");
+    let value = result.value();
+    assert_eq!(value["truncated"], true);
+    assert!(
+        value["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_output_tokens"))
+    );
+}
+
+#[tokio::test]
+async fn fixture_exposes_resources_and_prompts_through_the_runtime() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+
+    let resources = manager
+        .list_resources("fixture")
+        .await
+        .expect("resources should be listed");
+    let resources = resources
+        .as_array()
+        .expect("resource list should be an array");
+    assert_eq!(resources[0]["uri"], "fixture://info");
+    assert_eq!(resources[0]["name"], "fixture info");
+
+    let read = manager
+        .read_resource("fixture", "fixture://info")
+        .await
+        .expect("resource should be readable");
+    assert_eq!(read["contents"][0]["text"], "fixture information resource");
+
+    let prompts = manager
+        .list_prompts("fixture")
+        .await
+        .expect("prompts should be listed");
+    let prompts = prompts.as_array().expect("prompt list should be an array");
+    assert_eq!(prompts[0]["name"], "greet");
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("name".to_owned(), json!("Ada"));
+    let greeting = manager
+        .call_prompt("fixture", "greet", arguments)
+        .await
+        .expect("prompt should be callable");
+    assert!(
+        greeting["messages"][0]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Hello, Ada!"))
+    );
+}
+
+#[tokio::test]
+async fn resources_and_prompts_require_a_connected_server() {
+    let fixture = FixtureRuntime::new();
+    let manager = fixture.manager();
+
+    let error = manager
+        .list_resources("fixture")
+        .await
+        .expect_err("disconnected server must fail resource listing");
+    assert_eq!(error.code, RuntimeErrorCode::ServerNotConnected);
+
+    let error = manager
+        .list_prompts("fixture")
+        .await
+        .expect_err("disconnected server must fail prompt listing");
+    assert_eq!(error.code, RuntimeErrorCode::ServerNotConnected);
+}
+
+#[tokio::test]
 async fn batch_calls_run_concurrently_preserve_order_and_isolate_errors() {
     let fixture = FixtureRuntime::new();
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
 
@@ -166,7 +397,7 @@ async fn ten_concurrent_connects_start_one_real_process() {
     let manager = fixture.manager();
     let results = join_all((0..10).map(|_| {
         let manager = Arc::clone(&manager);
-        async move { manager.connect_server("fixture").await }
+        async move { manager.connect_server("fixture", None).await }
     }))
     .await;
 
@@ -183,7 +414,7 @@ async fn ten_concurrent_disconnects_join_one_real_shutdown() {
     let fixture = FixtureRuntime::new();
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
     let results = join_all((0..10).map(|_| {
@@ -219,8 +450,8 @@ async fn different_servers_connect_independently_and_shutdown_together() {
     .expect("second manifest should be written");
     let manager = fixture.manager();
     let (first, second) = tokio::join!(
-        manager.connect_server("fixture"),
-        manager.connect_server("second")
+        manager.connect_server("fixture", None),
+        manager.connect_server("second", None)
     );
 
     assert!(first.is_ok());
@@ -255,7 +486,7 @@ async fn disconnect_during_initialize_cancels_and_reaps_startup() {
     let manager = fixture.manager();
     let connection = {
         let manager = Arc::clone(&manager);
-        tokio::spawn(async move { manager.connect_server("fixture").await })
+        tokio::spawn(async move { manager.connect_server("fixture", None).await })
     };
     wait_for_file(&fixture.pid_file).await;
     let pid = fixture.pid();
@@ -279,13 +510,13 @@ async fn joined_connect_waiters_do_not_restart_after_a_later_disconnect() {
     let manager = fixture.manager();
     let first = {
         let manager = Arc::clone(&manager);
-        tokio::spawn(async move { manager.connect_server("fixture").await })
+        tokio::spawn(async move { manager.connect_server("fixture", None).await })
     };
     wait_for_file(&fixture.pid_file).await;
     let joiners = (0..10)
         .map(|_| {
             let manager = Arc::clone(&manager);
-            tokio::spawn(async move { manager.connect_server("fixture").await })
+            tokio::spawn(async move { manager.connect_server("fixture", None).await })
         })
         .collect::<Vec<_>>();
     for _ in 0..100 {
@@ -320,12 +551,12 @@ async fn unexpected_crash_becomes_failed_and_reconnects() {
     let fixture = FixtureRuntime::new();
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
 
     let crash = manager
-        .call_tool("fixture", "crash", json!({}), None)
+        .call_tool("fixture", "crash", json!({}), None, CallPolicy::default())
         .await
         .expect_err("crash should close the transport");
     assert!(matches!(
@@ -343,12 +574,18 @@ async fn unexpected_crash_becomes_failed_and_reconnects() {
     assert!(!first_error.message.is_empty());
 
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("failed fixture should reconnect");
     assert_eq!(fixture.startup_count(), 2);
     let echo = manager
-        .call_tool("fixture", "echo", json!({"message": "reconnected"}), None)
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "reconnected"}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("reconnected fixture should answer");
     assert_eq!(echo.value()["structuredContent"]["message"], "reconnected");
@@ -363,19 +600,25 @@ async fn enabled_reconnect_policy_recovers_without_an_explicit_connect() {
     let fixture = FixtureRuntime::new_with_reconnect();
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
 
     let _ = manager
-        .call_tool("fixture", "crash", json!({}), None)
+        .call_tool("fixture", "crash", json!({}), None, CallPolicy::default())
         .await
         .expect_err("crash should close the transport");
     fixture.wait_startup_count(2).await;
     wait_for_state(&manager, LifecycleState::Connected).await;
 
     let echo = manager
-        .call_tool("fixture", "echo", json!({"message": "automatic"}), None)
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "automatic"}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("automatically reconnected fixture should answer");
     assert_eq!(echo.value()["structuredContent"]["message"], "automatic");
@@ -432,7 +675,7 @@ async fn runtime_skill_chains_typed_outputs_and_stops_on_tool_errors() {
     .expect("fail-fast skill should be written");
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
 
@@ -504,7 +747,7 @@ async fn runtime_skill_rechecks_call_policy_for_every_step() {
     .expect("policy should be written");
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
 
@@ -547,7 +790,7 @@ async fn running_skill_finishes_its_snapshot_during_catalog_reload() {
     .expect("snapshot skill should be written");
     let manager = fixture.manager();
     manager
-        .connect_server("fixture")
+        .connect_server("fixture", None)
         .await
         .expect("fixture should connect");
     let running = {
@@ -576,6 +819,7 @@ async fn running_skill_finishes_its_snapshot_during_catalog_reload() {
 
 struct FixtureRuntime {
     _root: TempDir,
+    root: std::path::PathBuf,
     config_dir: std::path::PathBuf,
     startup_counter: std::path::PathBuf,
     pid_file: std::path::PathBuf,
@@ -611,8 +855,10 @@ impl FixtureRuntime {
         );
         fs::write(config_dir.join("fixture.toml"), manifest)
             .expect("fixture manifest should be written");
+        let root_path = root.path().to_path_buf();
         Self {
             _root: root,
+            root: root_path,
             config_dir,
             startup_counter,
             pid_file,
@@ -620,6 +866,10 @@ impl FixtureRuntime {
     }
 
     fn manager(&self) -> Arc<RuntimeManager> {
+        self.manager_with_usage(None)
+    }
+
+    fn manager_with_usage(&self, usage_root: Option<&std::path::Path>) -> Arc<RuntimeManager> {
         let loaded = ManifestLoader::new(ProcessEnvironment)
             .load_directory(&self.config_dir)
             .expect("fixture manifest should load");
@@ -628,7 +878,10 @@ impl FixtureRuntime {
         let skills = SkillCatalog::load_directory(&self.config_dir).expect("skills should load");
         RuntimeManager::new_with_configuration(
             Arc::new(registry),
-            RuntimeSettings::default(),
+            RuntimeSettings {
+                usage_root: usage_root.map(std::path::Path::to_path_buf),
+                ..RuntimeSettings::default()
+            },
             policy,
             skills,
         )
@@ -687,6 +940,7 @@ fn batch_call_for(
         tool_name: tool_name.to_owned(),
         arguments,
         timeout_ms,
+        call_policy: CallPolicy::default(),
     }
 }
 
@@ -730,4 +984,45 @@ async fn wait_for_process_exit(pid: u32) {
 
     #[cfg(not(target_os = "linux"))]
     let _ = pid;
+}
+
+#[tokio::test]
+async fn usage_memory_persists_across_manager_restarts() {
+    let fixture = FixtureRuntime::new();
+    let usage_root = fixture.root.join("usage");
+    let manager = fixture.manager_with_usage(Some(&usage_root));
+    manager
+        .connect_server("fixture", Some("/tmp/project-a"))
+        .await
+        .expect("fixture should connect");
+    manager
+        .call_tool(
+            "fixture",
+            "echo",
+            json!({"message": "one"}),
+            None,
+            CallPolicy::default(),
+        )
+        .await
+        .expect("echo should succeed");
+    manager
+        .call_tool("fixture", "missing", json!({}), None, CallPolicy::default())
+        .await
+        .expect_err("missing tool should fail");
+    std::mem::forget(manager);
+
+    let restarted = fixture.manager_with_usage(Some(&usage_root));
+    let servers = restarted.list_servers().await;
+    let fixture_summary = servers
+        .iter()
+        .find(|summary| summary.id == "fixture")
+        .expect("fixture should be listed");
+    assert_eq!(fixture_summary.use_count, Some(2));
+    assert_eq!(fixture_summary.error_count, Some(1));
+    assert!(
+        fixture_summary
+            .projects
+            .contains(&"/tmp/project-a".to_owned())
+    );
+    assert!(fixture_summary.last_used_at_unix_ms.is_some());
 }

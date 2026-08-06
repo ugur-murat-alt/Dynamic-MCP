@@ -171,11 +171,35 @@ Use `--bridge-command <PATH>` with repeated `--bridge-arg <ARG>` values when an
 existing harness must launch a daemon-bootstrap or supervisor wrapper instead
 of invoking `mcp-host mcp` directly.
 
-Once connected through a harness, agents should use the nine Dynamic MCP tools
-for runtime work: `list_servers`, `inspect_server`, `connect_server`,
-`list_tools`, `call_tool`/`call_tools`, `refresh_server`, `disconnect_server`,
-and `status`. The terminal CLI is for installation, daemon bootstrap, and
-diagnostics when that MCP surface is unavailable.
+Once connected through a harness, agents should use the Dynamic MCP tools for
+runtime work: `list_servers`, `inspect_server`, `connect_server`, `list_tools`,
+`find_tool`, `call_tool`/`call_tools`, `refresh_server`, `disconnect_server`,
+`status`, and — for servers that advertise them — `list_resources`,
+`read_resource`, `list_prompts`, and `call_prompt`. The surface is
+agent-friendly: `call_tool` auto-connects registered servers, recovers from
+stale tool caches with a single refresh-retry pass, attaches close-name
+`suggestions` to `TOOL_NOT_FOUND` errors, and honors an optional
+`max_output_tokens` budget. `list_servers` and `status --stats` expose durable
+usage memory (call counts, failures, last use, project associations). The
+terminal CLI is for installation, daemon bootstrap, and diagnostics when that
+MCP surface is unavailable.
+
+### OpenCode serve integration (native per-server tools)
+
+When opencode runs in server mode (`opencode serve`), the daemon can register
+each connected downstream server as its own MCP server at runtime, so agents
+see native tool names (`echo`, `add`, ...) instead of a routing layer:
+
+```
+mcp-host daemon run --config-dir config --opencode-serve-url http://127.0.0.1:4096
+```
+
+On `connect_server` the daemon posts `mcp-host-<server>` to the running
+`opencode serve` `/mcp` API, pointing at a per-server proxy socket
+(`<runtime-dir>/mcp-<server>.sock`). On `disconnect_server` it posts the
+matching disconnect and removes the socket. Registration is runtime-only:
+restarting `opencode serve` drops the entry, and there is no remove endpoint in
+this opencode version, so disconnect marks the server `disabled`.
 
 For VS Code, the officially documented workspace file is `.vscode/mcp.json`:
 
@@ -242,6 +266,31 @@ mcp-host daemon stop --runtime-dir target/mcp-host-runtime
 Daemon shutdown closes inbound MCP sessions, disconnects upstream sessions,
 reaps fixture children, removes IPC endpoints and metadata, and releases the
 singleton lock.
+
+## Terminal Convenience
+
+The CLI favors short, discoverable commands. Most commands have aliases
+(`ls`, `c`, `dc`, `t`, `rf`, `ca`, `b`, `st`, `sk`, `pkg`, `d`, `a`, `h`),
+and display commands render human-readable tables unless `--json` is given.
+
+Three commands make everyday use easier:
+
+```bash
+# Interactive session with Tab completion for servers, tools, and flags
+mcp-host shell
+
+# Health check for the installation, daemon, PATH, and harness skills
+mcp-host doctor
+
+# Scaffold a starter config directory (example.toml + policy.toml + README)
+mcp-host init --dir config
+
+# Shell completions for bash, zsh, fish, powershell, or elvish
+mcp-host completions zsh > /usr/local/share/zsh/site-functions/_mcp-host
+```
+
+See [CLI](docs/cli.md) for the full command reference, aliases, exit codes,
+and the interactive shell contract.
 
 ## Documentation
 

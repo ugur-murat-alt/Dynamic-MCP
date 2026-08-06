@@ -12,7 +12,7 @@ them before the command for consistency.
 | Flag | Meaning |
 | --- | --- |
 | `--runtime-dir <DIR>` | Directory containing the daemon lock, metadata, and endpoint state. Defaults on Unix to `$XDG_RUNTIME_DIR/mcp-host` when `XDG_RUNTIME_DIR` is non-empty; otherwise it uses the platform local-data directory plus `runtime`. |
-| `--json` | Write successful command output as compact JSON. Without it, successful values are pretty-printed JSON. Runtime errors are JSON on stdout only with this flag, except for `mcp`. |
+| `--json` | Write successful command output as compact JSON. Without it, successful values are pretty-printed JSON, except for the display commands listed below, which render human-readable tables or lines. Runtime errors are JSON on stdout only with this flag, except for `mcp`. |
 | `--timeout <MS>` | Control request deadline in milliseconds, inclusive range `1..=300000`; default is 65 seconds, except OAuth login waits up to 300 seconds. For `call`, the same optional value is also sent to the daemon as the downstream tool timeout. Batch control deadlines are derived from their items. |
 | `-h`, `--help` | Show Clap-generated help for the selected command. `--help` includes detailed examples where available. |
 | `-V`, `--version` | Show the binary version. |
@@ -23,25 +23,41 @@ selected runtime directory's daemon endpoint to already be live. `mcp` also
 requires it, but uses its own fixed five-second connect deadline rather than
 `--timeout`. Harness child CLIs use a fixed 60-second deadline.
 
+## Human-Readable Output
+
+Without `--json`, these commands render friendly output instead of JSON:
+
+| Command | Human format |
+| --- | --- |
+| `list` / `ls` | Table of ID, name, state, tool count, and transport. |
+| `tools` / `t` | Sorted table of tool names and descriptions; appends a stale note when the snapshot is stale. |
+| `status` / `st` | Key-value lines for version, protocol, uptime, server counts, sessions, and endpoint readiness. `--stats` appends a durable usage table (calls, errors, last use, projects). |
+| `skill list` / `sk list` | Table of skill ID, name, and step count. |
+| `connect` / `c` | One line, e.g. `fixture: connected (5 tools, MCP 2025-11-25)`. |
+| `disconnect` / `dc` | One line, e.g. `fixture: disconnected`. |
+
+Every other command keeps JSON output; add `--json` at any time for the
+machine-readable form.
+
 ## Commands
 
 | Command | Control operation | Example |
 | --- | --- | --- |
-| `daemon run --config-dir <DIR>` | Start the foreground daemon and load manifests from `<DIR>`. | `mcp-host --runtime-dir /run/user/1000/mcp-host daemon run --config-dir ./config` |
+| `daemon run --config-dir <DIR> [--opencode-serve-url <URL>]` | Start the foreground daemon and load manifests from `<DIR>`. `--opencode-serve-url` registers a per-server MCP proxy with a running `opencode serve` instance on every connect. | `mcp-host --runtime-dir /run/user/1000/mcp-host daemon run --config-dir ./config --opencode-serve-url http://127.0.0.1:4096` |
 | `daemon status` | Read daemon status. | `mcp-host --json daemon status` |
 | `daemon stop` | Request orderly daemon shutdown. | `mcp-host daemon stop` |
 | `daemon service install --config-dir <DIR> [--manager <...>] [--scope <...>] [--no-start]` | Install/repair, enable/load, and normally start the native service. | `mcp-host daemon service install --config-dir ./config` |
 | `daemon service uninstall --config-dir <DIR> [--manager <...>] [--scope <...>]` | Stop, disable/unload, and remove a managed native service. | `mcp-host daemon service uninstall --config-dir ./config` |
 | `daemon service status --config-dir <DIR> [--manager <...>] [--scope <...>]` | Read artifact ownership/drift plus loaded, enabled, and active state. | `mcp-host --json daemon service status --config-dir ./config` |
-| `list` | List configured servers. | `mcp-host list` |
-| `inspect <SERVER_ID>` | Inspect one server. | `mcp-host inspect filesystem` |
-| `connect <SERVER_ID>` | Connect one server. | `mcp-host connect filesystem` |
-| `disconnect <SERVER_ID>` | Disconnect one server. | `mcp-host disconnect filesystem` |
-| `tools <SERVER_ID> [--refresh]` | List a server's tools; `--refresh` refreshes first. | `mcp-host tools filesystem --refresh` |
-| `refresh <SERVER_ID>` | Refresh one server. | `mcp-host refresh filesystem` |
-| `call <SERVER_ID> <TOOL_NAME> [--arguments <JSON> | --arguments-file <PATH>]` | Invoke a tool. | `mcp-host call filesystem read_file --arguments '{"path":"README.md"}'` |
-| `batch --calls <JSON_ARRAY> | --calls-file <PATH\|->` | Invoke 1 through 32 already-connected tools in parallel. | `mcp-host batch --calls '[{"server_id":"fixture","tool_name":"echo"}]'` |
-| `status` | Read daemon status; equivalent control operation to `daemon status`. | `mcp-host status` |
+| `list` (alias `ls`) | List configured servers. | `mcp-host list` |
+| `inspect <SERVER_ID>` (alias `i`) | Inspect one server. | `mcp-host inspect filesystem` |
+| `connect <SERVER_ID>` (alias `c`) | Connect one server; records the current working directory as a project label in durable usage memory. | `mcp-host connect filesystem` |
+| `disconnect <SERVER_ID>` (alias `dc`) | Disconnect one server. | `mcp-host disconnect filesystem` |
+| `tools <SERVER_ID> [--refresh]` (alias `t`) | List a server's tools; `--refresh` refreshes first. | `mcp-host tools filesystem --refresh` |
+| `refresh <SERVER_ID>` (alias `rf`) | Refresh one server. | `mcp-host refresh filesystem` |
+| `call <SERVER_ID> <TOOL_NAME> [--arguments <JSON> \| --arguments-file <PATH>] [--no-auto-connect] [--no-retry] [--max-output-tokens <N>]` (alias `ca`) | Invoke a tool. Implicitly connects a registered but disconnected server, recovers from stale caches with one refresh-retry pass, and reports close-name suggestions on `TOOL_NOT_FOUND`. `--max-output-tokens` caps the serialized result (4 bytes/token). | `mcp-host call filesystem read_file --arguments '{"path":"README.md"}'` |
+| `batch --calls <JSON_ARRAY> \| --calls-file <PATH\|->` (alias `b`) | Invoke 1 through 32 already-connected tools in parallel. | `mcp-host batch --calls '[{"server_id":"fixture","tool_name":"echo"}]'` |
+| `status [--stats]` (alias `st`) | Read daemon status; equivalent control operation to `daemon status`. `--stats` adds the per-server usage table. | `mcp-host status --stats` |
 | `auth login <SERVER_ID>` | Start authorization-code PKCE and complete it through an ephemeral loopback callback. | `mcp-host auth login remote` |
 | `auth status <SERVER_ID>` | Show whether local OAuth credentials exist and list granted scopes without exposing tokens. | `mcp-host auth status remote` |
 | `auth logout <SERVER_ID>` | Disconnect the server and remove local OAuth credentials. | `mcp-host auth logout remote` |
@@ -49,12 +65,61 @@ requires it, but uses its own fixed five-second connect deadline rather than
 | `skill run <SKILL_ID> [--input <JSON> \| --input-file <PATH\|->]` | Run 1-16 tool steps sequentially and fail fast. | `mcp-host skill run issue-notify --input '{"title":"Bug"}'` |
 | `package install <SERVER_ID>` | Explicitly install the exact package declared by the manifest. | `mcp-host package install remote` |
 | `harness install <TARGET>` | Register the stdio bridge with `opencode`, `claude-code`, or `all`. | `mcp-host harness install all` |
-| `mcp` | Bridge stdin/stdout to the daemon's MCP endpoint. | `mcp-host mcp` |
+| `mcp [--endpoint <PATH>]` | Bridge stdin/stdout to the daemon's MCP endpoint; `--endpoint` selects a per-server proxy socket. | `mcp-host mcp --endpoint /run/user/1000/mcp-host/mcp-fixture.sock` |
+| `shell` | Start an interactive terminal session. | `mcp-host shell` |
+| `completions <SHELL>` | Print a completion script for `bash`, `zsh`, `fish`, `powershell`, or `elvish`. | `mcp-host completions fish > ~/.config/fish/completions/mcp-host.fish` |
+| `doctor` | Run installation, daemon, and harness health checks. | `mcp-host doctor` |
+| `init [--dir <DIR>] [--force]` | Scaffold a starter configuration directory (default `./config`). | `mcp-host init --dir config` |
 
 `--config-dir` belongs to `daemon run` and each `daemon service` subcommand; it
 is required and has no default.
 `--refresh` belongs only to `tools`. `call` requires the positional server ID
 and tool name. `--arguments` and `--arguments-file` are mutually exclusive.
+
+## Interactive Shell
+
+`mcp-host shell` starts a persistent terminal session. It reuses the same
+commands as the one-shot CLI, including aliases, with these extras:
+
+- Tab completion for command names, aliases, registered server IDs, discovered
+  tool names (after `call <SERVER>`), and common flags.
+- A `help` command listing the available commands.
+- `exit`, `quit`, or Ctrl-D to leave the session.
+- Shell history stored under the platform state directory
+  (`~/.local/state/mcp-host/history.txt` on Linux).
+
+When stdin is not a terminal, the shell reads one command per line, so it can
+be scripted:
+
+```bash
+printf 'c fixture\ncall fixture echo --arguments '"'"'{"message":"hi"}'"'"'\nexit\n' \
+  | mcp-host shell --runtime-dir /path/to/runtime
+```
+
+Stdin-based input flags (`--arguments-file -`, `--calls-file -`,
+`--input-file -`) are rejected inside the shell because stdin is the shell
+itself.
+
+## Doctor
+
+`mcp-host doctor` checks, without modifying anything:
+
+- the binary and its version,
+- whether `mcp-host` on `PATH` resolves to the running binary,
+- the runtime directory,
+- daemon reachability and version agreement,
+- the OpenCode and Claude Code `dynamic-mcp` skill installation.
+
+Each check is reported as `[ok]`, `[warn]`, or `[error]`; the exit status is
+`0` when no check is an error and `4` otherwise. `--json` prints the complete
+report as one JSON object.
+
+## Init
+
+`mcp-host init [--dir <DIR>] [--force]` writes a starter configuration
+directory containing `example.toml` (a documented stdio manifest),
+`policy.toml`, and a short `README.md`. Existing files are never overwritten
+unless `--force` is passed.
 
 ## Native Service Management
 

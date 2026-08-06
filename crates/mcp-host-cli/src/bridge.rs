@@ -11,12 +11,30 @@ use crate::ipc;
 
 const STDIN_EOF_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
-/// Connects standard input and output directly to the daemon's MCP endpoint.
+/// Connects standard input and output directly to the daemon's default MCP endpoint.
 pub async fn run_stdio_bridge(
     runtime_dir: &Path,
     connect_timeout: Duration,
 ) -> Result<(), RuntimeError> {
     let stream = ipc::connect_mcp(runtime_dir, connect_timeout).await?;
+    let (socket_reader, socket_writer) = stream.split();
+
+    bridge_streams(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        socket_reader,
+        socket_writer,
+    )
+    .await
+    .map_err(ipc_unavailable)
+}
+
+/// Connects standard input and output directly to one MCP endpoint.
+pub async fn run_stdio_bridge_at(
+    endpoint: &Path,
+    connect_timeout: Duration,
+) -> Result<(), RuntimeError> {
+    let stream = ipc::connect_mcp_at(endpoint, connect_timeout).await?;
     let (socket_reader, socket_writer) = stream.split();
 
     bridge_streams(

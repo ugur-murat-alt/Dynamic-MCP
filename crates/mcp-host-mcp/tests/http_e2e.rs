@@ -13,7 +13,9 @@ use axum::{
     middleware::{self, Next},
     response::Response,
 };
-use mcp_host_core::{EnvironmentAccessError, EnvironmentProvider, ManifestLoader, RegistryBuilder};
+use mcp_host_core::{
+    CallPolicy, EnvironmentAccessError, EnvironmentProvider, ManifestLoader, RegistryBuilder,
+};
 use mcp_host_mcp::{RuntimeManager, RuntimeSettings, fixture::FixtureServer};
 use rmcp::{
     ErrorData, ServerHandler,
@@ -95,7 +97,7 @@ async fn real_streamable_http_initialize_headers_tools_call_and_disconnect() {
     let manager = RuntimeManager::new(Arc::new(registry), RuntimeSettings::default());
 
     let connected = manager
-        .connect_server("http-fixture")
+        .connect_server("http-fixture", None)
         .await
         .expect("HTTP fixture should initialize");
     assert_eq!(connected.protocol_version, "2025-11-25");
@@ -106,6 +108,7 @@ async fn real_streamable_http_initialize_headers_tools_call_and_disconnect() {
             "echo",
             json!({"message": "over-http"}),
             None,
+            CallPolicy::default(),
         )
         .await
         .expect("HTTP tool call should succeed");
@@ -179,7 +182,7 @@ async fn paginated_discovery_and_failed_refresh_preserve_the_stale_snapshot() {
     .expect("registry should build");
     let manager = RuntimeManager::new(Arc::new(registry), RuntimeSettings::default());
     let connected = manager
-        .connect_server("paginated")
+        .connect_server("paginated", None)
         .await
         .expect("paginated server should connect");
     let names = connected
@@ -243,7 +246,7 @@ async fn https_transport_opens_a_tls_connection() {
     );
     let connecting = tokio::spawn({
         let manager = Arc::clone(&manager);
-        async move { manager.connect_server("https-fixture").await }
+        async move { manager.connect_server("https-fixture", None).await }
     });
 
     let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())

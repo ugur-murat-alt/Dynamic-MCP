@@ -15,7 +15,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use mcp_host_core::{EnvironmentAccessError, EnvironmentProvider, ManifestLoader, RegistryBuilder};
+use mcp_host_core::{
+    CallPolicy, EnvironmentAccessError, EnvironmentProvider, ManifestLoader, RegistryBuilder,
+};
 use mcp_host_mcp::{RuntimeManager, RuntimeSettings, fixture::FixtureServer};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -227,12 +229,18 @@ async fn authorization_code_pkce_dynamic_registration_refresh_and_logout() {
     assert_eq!(credential_file_count(&auth_root), 1);
 
     let connected = manager
-        .connect_server(SERVER_ID)
+        .connect_server(SERVER_ID, None)
         .await
         .expect("expired access token should refresh and connect");
     assert_eq!(connected.tool_count, 5);
     let result = manager
-        .call_tool(SERVER_ID, "echo", json!({"message": "authorized"}), None)
+        .call_tool(
+            SERVER_ID,
+            "echo",
+            json!({"message": "authorized"}),
+            None,
+            CallPolicy::default(),
+        )
         .await
         .expect("Bearer-protected tool call should succeed");
     assert_eq!(result.value()["structuredContent"]["message"], "authorized");

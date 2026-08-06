@@ -13,9 +13,11 @@ use interprocess::local_socket::traits::tokio::Listener as _;
 use mcp_host_core::{
     CONTROL_PROTOCOL_VERSION, ControlRequest, ControlRequestEnvelope, ControlResponseEnvelope,
     ManifestLoader, Policy, ProcessEnvironment, RegistryBuilder, RuntimeError, RuntimeErrorCode,
-    SkillCatalog,
+    ServerId, SkillCatalog,
 };
-use mcp_host_mcp::{HostMcpServer, HostRuntimeState, RuntimeManager, RuntimeSettings};
+use mcp_host_mcp::{
+    HostMcpServer, HostRuntimeState, ProxyMcpServer, RuntimeManager, RuntimeSettings,
+};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use rmcp::ServiceExt as _;
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,291 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ipc::{EndpointKind, EndpointSet, read_json, write_json};
 
+/// Shared daemon state passed to every control request handler.
+struct DaemonContext {
+    runtime: Arc<RuntimeManager>,
+    state: Arc<HostRuntimeState>,
+    filtered: Arc<std::sync::Mutex<std::collections::BTreeMap<String, FilteredEndpoint>>>,
+    linker: OpenCodeLinker,
+}
+
+/// One live per-server proxy MCP endpoint.
+struct FilteredEndpoint {
+    path: String,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+/// Registers and unregisters per-server MCP proxies in a running
+/// `opencode serve` instance through its runtime `/mcp` API.
+#[derive(Clone)]
+struct OpenCodeLinker {
+    url: Option<String>,
+    bridge_exe: Option<std::path::PathBuf>,
+    runtime_dir: std::path::PathBuf,
+    client: reqwest::Client,
+}
+
+impl OpenCodeLinker {
+    fn new(url: Option<String>, runtime_dir: std::path::PathBuf) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            url,
+            bridge_exe: std::env::current_exe().ok(),
+            runtime_dir,
+            client,
+        }
+    }
+
+    fn server_name(server_id: &str) -> String {
+        format!("mcp-host-{server_id}")
+    }
+
+    async fn register(&self, server_id: &str) {
+        let Some(url) = &self.url else {
+            return;
+        };
+        let Some(exe) = &self.bridge_exe else {
+            return;
+        };
+        let command = vec![
+            exe.display().to_string(),
+            "mcp".to_owned(),
+            "--runtime-dir".to_owned(),
+            self.runtime_dir.display().to_string(),
+            "--endpoint".to_owned(),
+            filtered_endpoint_path(&self.runtime_dir, server_id),
+        ];
+        let body = json!({
+            "name": Self::server_name(server_id),
+            "config": {
+                "type": "local",
+                "command": command,
+                "cwd": self.runtime_dir.display().to_string(),
+            }
+        });
+        match self
+            .client
+            .post(format!("{url}/mcp"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                tracing::info!(operation = "opencode_register", server_id, status = %response.status());
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    operation = "opencode_register",
+                    server_id,
+                    status = %response.status(),
+                    "opencode serve rejected the proxy registration"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    operation = "opencode_register",
+                    server_id,
+                    error = %error,
+                    "opencode serve is unreachable"
+                );
+            }
+        }
+    }
+
+    async fn unregister(&self, server_id: &str) {
+        let Some(url) = &self.url else {
+            return;
+        };
+        match self
+            .client
+            .post(format!(
+                "{url}/mcp/{}/disconnect",
+                Self::server_name(server_id)
+            ))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                tracing::info!(
+                    operation = "opencode_unregister",
+                    server_id,
+                    status = %response.status()
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    operation = "opencode_unregister",
+                    server_id,
+                    error = %error,
+                    "opencode serve is unreachable"
+                );
+            }
+        }
+    }
+}
+
+/// Normalizes a caller-supplied server ID the same way the runtime does,
+/// so proxy sockets and opencode registrations use canonical names.
+fn normalize_server_id(server_id: &str) -> String {
+    ServerId::parse(server_id)
+        .map(|id| id.as_str().to_owned())
+        .unwrap_or_else(|_| server_id.to_owned())
+}
+
+fn filtered_endpoint_path(runtime_dir: &std::path::Path, server_id: &str) -> String {
+    #[cfg(unix)]
+    {
+        runtime_dir
+            .join(format!("mcp-{server_id}.sock"))
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(windows)]
+    {
+        use std::hash::{BuildHasher, Hasher};
+        let hash = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hasher.write(runtime_dir.to_string_lossy().as_bytes());
+            hasher.finish()
+        };
+        format!("mcp-host-{hash:016x}-mcp-{server_id}")
+    }
+}
+
+/// Binds the per-server proxy endpoint when it is not already live.
+/// Returns true only when the endpoint was newly created.
+async fn ensure_filtered_endpoint(context: &DaemonContext, server_id: &str) -> bool {
+    if context
+        .filtered
+        .lock()
+        .expect("filtered endpoint lock")
+        .contains_key(server_id)
+    {
+        return false;
+    }
+    let path = filtered_endpoint_path(&context.linker.runtime_dir, server_id);
+    let listener = match crate::ipc::bind_socket_at(std::path::Path::new(&path)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(
+                operation = "proxy_bind",
+                server_id,
+                error = %error,
+                "failed to bind the per-server proxy endpoint"
+            );
+            return false;
+        }
+    };
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(proxy_accept_loop(
+        listener,
+        Arc::clone(&context.runtime),
+        Arc::clone(&context.state),
+        cancel.clone(),
+        server_id.to_owned(),
+    ));
+    context
+        .filtered
+        .lock()
+        .expect("filtered endpoint lock")
+        .insert(
+            server_id.to_owned(),
+            FilteredEndpoint { path, cancel, task },
+        );
+    tracing::info!(operation = "proxy_ready", server_id);
+    true
+}
+
+async fn drop_filtered_endpoint(context: &DaemonContext, server_id: &str) {
+    let Some(endpoint) = context
+        .filtered
+        .lock()
+        .expect("filtered endpoint lock")
+        .remove(server_id)
+    else {
+        return;
+    };
+    endpoint.cancel.cancel();
+    let _ = timeout(Duration::from_secs(2), endpoint.task).await;
+    let _ = std::fs::remove_file(&endpoint.path);
+    tracing::info!(operation = "proxy_stopped", server_id);
+}
+
+async fn shutdown_filtered_endpoints(context: &DaemonContext) {
+    let endpoints: Vec<(String, FilteredEndpoint)> =
+        std::mem::take(&mut *context.filtered.lock().expect("filtered endpoint lock"))
+            .into_iter()
+            .collect();
+    for (server_id, endpoint) in endpoints {
+        endpoint.cancel.cancel();
+        let _ = timeout(Duration::from_secs(2), endpoint.task).await;
+        let _ = std::fs::remove_file(&endpoint.path);
+        context.linker.unregister(&server_id).await;
+        tracing::info!(operation = "proxy_shutdown", server_id);
+    }
+}
+
+async fn proxy_accept_loop(
+    listener: interprocess::local_socket::tokio::Listener,
+    runtime: Arc<RuntimeManager>,
+    state: Arc<HostRuntimeState>,
+    cancellation: CancellationToken,
+    server_id: String,
+) {
+    let mut sessions = JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = listener.accept() => match result {
+                Ok(stream) => {
+                    sessions.spawn(serve_proxy_session(
+                        stream,
+                        Arc::clone(&runtime),
+                        Arc::clone(&state),
+                        server_id.clone(),
+                        cancellation.clone(),
+                    ));
+                }
+                Err(_) => tracing::debug!(operation = "proxy_accept", code = "IPC_UNAVAILABLE"),
+            },
+            Some(result) = sessions.join_next(), if !sessions.is_empty() => {
+                if result.is_err() {
+                    tracing::debug!(operation = "proxy_session", code = "TRANSPORT_CLOSED");
+                }
+            }
+        }
+    }
+    drain_tasks(&mut sessions, "proxy_session_shutdown").await;
+}
+
+async fn serve_proxy_session(
+    stream: interprocess::local_socket::tokio::Stream,
+    runtime: Arc<RuntimeManager>,
+    state: Arc<HostRuntimeState>,
+    server_id: String,
+    cancellation: CancellationToken,
+) {
+    let _session = state.track_downstream_session();
+    let (reader, writer) = tokio::io::split(stream);
+    let server = ProxyMcpServer::from_runtime(runtime, server_id).await;
+    match server
+        .serve_with_ct((reader, writer), cancellation.child_token())
+        .await
+    {
+        Ok(service) => {
+            if service.waiting().await.is_err() {
+                tracing::debug!(operation = "proxy_wait", code = "TRANSPORT_CLOSED");
+            }
+        }
+        Err(_) => tracing::debug!(operation = "proxy_initialize", code = "PROTOCOL_ERROR"),
+    }
+}
+
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Filesystem locations required to start a daemon instance.
@@ -35,6 +322,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct DaemonOptions {
     pub config_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    /// Optional `opencode serve` base URL; per-server MCP proxies are
+    /// registered there on connect and disconnected on disconnect.
+    pub opencode_serve_url: Option<String>,
 }
 
 /// Secret-free daemon state written while the local endpoints are live.
@@ -119,6 +409,7 @@ async fn run_daemon_inner(
         RuntimeSettings {
             package_root: Some(options.runtime_dir.join("packages")),
             auth_root,
+            usage_root: Some(options.runtime_dir.clone()),
             ..RuntimeSettings::default()
         },
         policy,
@@ -174,18 +465,26 @@ async fn run_daemon_inner(
             return Err(error);
         }
     };
+    let context = Arc::new(DaemonContext {
+        runtime: Arc::clone(&runtime),
+        state: Arc::clone(&state),
+        filtered: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        linker: OpenCodeLinker::new(
+            options.opencode_serve_url.clone(),
+            options.runtime_dir.clone(),
+        ),
+    });
     state.set_control_ready(true);
     state.set_mcp_ready(true);
     let control_accept = tokio::spawn(control_accept_loop(
         control_listener,
-        Arc::clone(&runtime),
-        Arc::clone(&state),
+        Arc::clone(&context),
         cancellation.clone(),
     ));
     let mcp_accept = tokio::spawn(mcp_accept_loop(
         mcp_listener,
-        Arc::clone(&runtime),
-        Arc::clone(&state),
+        Arc::clone(&context.runtime),
+        Arc::clone(&context.state),
         cancellation.clone(),
     ));
     if let Some(ready) = ready {
@@ -202,6 +501,7 @@ async fn run_daemon_inner(
     wait_for_accept_task(control_accept, "control_accept_shutdown").await;
     wait_for_accept_task(mcp_accept, "mcp_accept_shutdown").await;
     wait_for_accept_task(reload_task, "config_reload_shutdown").await;
+    shutdown_filtered_endpoints(&context).await;
     let shutdown = timeout(SHUTDOWN_TIMEOUT, runtime.shutdown()).await;
     files.cleanup();
 
@@ -253,8 +553,7 @@ impl DaemonFiles {
 
 async fn control_accept_loop(
     listener: Listener,
-    runtime: Arc<RuntimeManager>,
-    state: Arc<HostRuntimeState>,
+    context: Arc<DaemonContext>,
     cancellation: CancellationToken,
 ) {
     let mut connections = JoinSet::new();
@@ -265,8 +564,7 @@ async fn control_accept_loop(
                 Ok(stream) => {
                     connections.spawn(handle_control_connection(
                         stream,
-                        Arc::clone(&runtime),
-                        Arc::clone(&state),
+                        Arc::clone(&context),
                         cancellation.clone(),
                     ));
                 }
@@ -315,8 +613,7 @@ async fn mcp_accept_loop(
 
 async fn handle_control_connection(
     mut stream: Stream,
-    runtime: Arc<RuntimeManager>,
-    state: Arc<HostRuntimeState>,
+    context: Arc<DaemonContext>,
     cancellation: CancellationToken,
 ) {
     let request = match read_json::<_, ControlRequestEnvelope>(&mut stream).await {
@@ -338,7 +635,7 @@ async fn handle_control_connection(
     } else if cancellation.is_cancelled() && !allowed_during_shutdown(&request.request) {
         ControlResponseEnvelope::failure(request.request_id, daemon_shutting_down_error())
     } else {
-        match dispatch_request(&runtime, &state, request.request).await {
+        match dispatch_request(&context, request.request).await {
             Ok(result) => ControlResponseEnvelope::success(request.request_id, result),
             Err(error) => ControlResponseEnvelope::failure(request.request_id, error),
         }
@@ -468,24 +765,40 @@ async fn serve_mcp_session(
 }
 
 async fn dispatch_request(
-    runtime: &RuntimeManager,
-    state: &HostRuntimeState,
+    context: &DaemonContext,
     request: ControlRequest,
 ) -> Result<Value, RuntimeError> {
+    let runtime = &context.runtime;
     match request {
         ControlRequest::Ping => Ok(json!({ "ok": true })),
-        ControlRequest::Status => json_value("status", state.status(runtime).await),
+        ControlRequest::Status => json_value("status", context.state.status(runtime).await),
         ControlRequest::ListServers => json_value("list_servers", runtime.list_servers().await),
         ControlRequest::InspectServer { server_id } => {
             json_value("inspect_server", runtime.inspect_server(&server_id).await?)
         }
-        ControlRequest::ConnectServer { server_id } => {
-            json_value("connect_server", runtime.connect_server(&server_id).await?)
+        ControlRequest::ConnectServer { server_id, project } => {
+            let normalized = normalize_server_id(&server_id);
+            let result = runtime
+                .connect_server(&normalized, project.as_deref())
+                .await;
+            if result.is_ok() && ensure_filtered_endpoint(context, &normalized).await {
+                let linker = context.linker.clone();
+                let id = normalized.clone();
+                tokio::spawn(async move { linker.register(&id).await });
+            }
+            json_value("connect_server", result?)
         }
-        ControlRequest::DisconnectServer { server_id } => json_value(
-            "disconnect_server",
-            runtime.disconnect_server(&server_id).await?,
-        ),
+        ControlRequest::DisconnectServer { server_id } => {
+            let normalized = normalize_server_id(&server_id);
+            let result = runtime.disconnect_server(&normalized).await;
+            if result.is_ok() {
+                drop_filtered_endpoint(context, &normalized).await;
+                let linker = context.linker.clone();
+                let id = normalized.clone();
+                tokio::spawn(async move { linker.unregister(&id).await });
+            }
+            json_value("disconnect_server", result?)
+        }
         ControlRequest::ListTools { server_id, refresh } => {
             json_value("list_tools", runtime.list_tools(&server_id, refresh).await?)
         }
@@ -494,8 +807,9 @@ async fn dispatch_request(
             tool_name,
             arguments,
             timeout_ms,
+            call_policy,
         } => Ok(runtime
-            .call_tool(&server_id, &tool_name, arguments, timeout_ms)
+            .call_tool(&server_id, &tool_name, arguments, timeout_ms, call_policy)
             .await?
             .into_value()),
         ControlRequest::CallTools { calls } => {
@@ -766,7 +1080,7 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use mcp_host_core::{
-        BatchToolCall, HostStatus, ManifestLoader, ProcessEnvironment, RegistryBuilder,
+        BatchToolCall, CallPolicy, HostStatus, ManifestLoader, ProcessEnvironment, RegistryBuilder,
     };
     use mcp_host_mcp::{HostRuntimeState, RuntimeManager, RuntimeSettings};
     use serde_json::json;
@@ -774,8 +1088,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CONTROL_PROTOCOL_VERSION, ControlRequest, DaemonMetadata, DaemonOptions, RuntimeErrorCode,
-        allowed_during_shutdown, dispatch_request, protocol_mismatch_error, run_daemon_with_ready,
+        CONTROL_PROTOCOL_VERSION, ControlRequest, DaemonContext, DaemonMetadata, DaemonOptions,
+        OpenCodeLinker, RuntimeErrorCode, allowed_during_shutdown, dispatch_request,
+        protocol_mismatch_error, run_daemon_with_ready,
     };
 
     #[test]
@@ -818,6 +1133,7 @@ mod tests {
             tool_name: "echo".to_owned(),
             arguments: json!({}),
             timeout_ms: None,
+            call_policy: CallPolicy::default(),
         };
         let batch = ControlRequest::CallTools {
             calls: vec![BatchToolCall {
@@ -825,6 +1141,7 @@ mod tests {
                 tool_name: "echo".to_owned(),
                 arguments: json!({}),
                 timeout_ms: None,
+                call_policy: CallPolicy::default(),
             }],
         };
 
@@ -838,14 +1155,25 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let loaded = ManifestLoader::new(ProcessEnvironment).load_directory(directory.path())?;
         let registry = RegistryBuilder::build(loaded)?;
-        let runtime = RuntimeManager::new(Arc::new(registry), RuntimeSettings::default());
-        let state = HostRuntimeState::new();
+        let runtime = Arc::new(RuntimeManager::new(
+            Arc::new(registry),
+            RuntimeSettings::default(),
+        ));
+        let state = Arc::new(HostRuntimeState::new());
+        let linker_runtime = tempfile::tempdir().expect("linker runtime dir");
+        let context = Arc::new(DaemonContext {
+            runtime: Arc::clone(&runtime),
+            state: Arc::clone(&state),
+            filtered: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            linker: OpenCodeLinker::new(None, linker_runtime.path().to_path_buf()),
+        });
+        std::mem::forget(linker_runtime);
 
         assert_eq!(
-            dispatch_request(&runtime, &state, ControlRequest::Ping).await?,
+            dispatch_request(&context, ControlRequest::Ping).await?,
             json!({ "ok": true })
         );
-        let status = dispatch_request(&runtime, &state, ControlRequest::Status).await?;
+        let status = dispatch_request(&context, ControlRequest::Status).await?;
         let status: HostStatus = serde_json::from_value(status)?;
         assert_eq!(status.registry_server_count, 0);
         Ok(())
@@ -863,6 +1191,7 @@ mod tests {
             DaemonOptions {
                 config_dir,
                 runtime_dir,
+                opencode_serve_url: None,
             },
             cancellation.clone(),
             ready_tx,

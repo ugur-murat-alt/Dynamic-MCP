@@ -46,6 +46,10 @@ pub enum RuntimeErrorCode {
     SkillTemplateError,
     SkillUpstreamError,
     SkillOutputTooLarge,
+    ResourcesNotSupported,
+    PromptsNotSupported,
+    ResourceNotFound,
+    PromptNotFound,
     ServiceForeign,
     ServicePermissionDenied,
     ServiceManagerUnavailable,
@@ -91,6 +95,10 @@ impl RuntimeErrorCode {
             Self::SkillTemplateError => "SKILL_TEMPLATE_ERROR",
             Self::SkillUpstreamError => "SKILL_UPSTREAM_ERROR",
             Self::SkillOutputTooLarge => "SKILL_OUTPUT_TOO_LARGE",
+            Self::ResourcesNotSupported => "RESOURCES_NOT_SUPPORTED",
+            Self::PromptsNotSupported => "PROMPTS_NOT_SUPPORTED",
+            Self::ResourceNotFound => "RESOURCE_NOT_FOUND",
+            Self::PromptNotFound => "PROMPT_NOT_FOUND",
             Self::ServiceForeign => "SERVICE_FOREIGN",
             Self::ServicePermissionDenied => "SERVICE_PERMISSION_DENIED",
             Self::ServiceManagerUnavailable => "SERVICE_MANAGER_UNAVAILABLE",
@@ -113,6 +121,8 @@ pub struct RuntimeError {
     pub message: String,
     pub retryable: bool,
     pub source_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Box<Vec<ToolSuggestion>>>,
 }
 
 impl RuntimeError {
@@ -129,6 +139,7 @@ impl RuntimeError {
             message: message.into(),
             retryable: false,
             source_summary: None,
+            suggestions: None,
         }
     }
 
@@ -156,6 +167,12 @@ impl RuntimeError {
         self.source_summary = Some(source_summary.into());
         self
     }
+
+    #[must_use]
+    pub fn with_suggestions(mut self, suggestions: Vec<ToolSuggestion>) -> Self {
+        self.suggestions = Some(Box::new(suggestions));
+        self
+    }
 }
 
 impl fmt::Display for RuntimeError {
@@ -165,6 +182,74 @@ impl fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+/// A close-name suggestion for a misspelled or stale tool reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSuggestion {
+    pub server_id: String,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Caller-controlled invocation policy for downstream tool calls.
+///
+/// All fields default to the agent-friendly behavior: implicit connection and
+/// a single refresh-and-retry recovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallPolicy {
+    /// Connects a registered but disconnected server before calling its tools.
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+    /// Recovers from TOOL_NOT_FOUND/TOOLS_NOT_DISCOVERED with one refresh-retry pass.
+    #[serde(default = "default_true")]
+    pub auto_retry: bool,
+    /// Soft ceiling for the serialized result, in tokens (4 bytes per token).
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+}
+
+impl Default for CallPolicy {
+    fn default() -> Self {
+        Self {
+            auto_connect: true,
+            auto_retry: true,
+            max_output_tokens: None,
+        }
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Returns a truncated summary when `value` exceeds `max_tokens` (4 bytes per
+/// token), or `None` when the value fits within the budget.
+#[must_use]
+pub fn truncate_json(value: &Value, max_tokens: u64) -> Option<Value> {
+    let max_bytes = max_tokens.saturating_mul(4);
+    let bytes = serde_json::to_vec(value).ok()?.len() as u64;
+    if bytes <= max_bytes {
+        return None;
+    }
+    let preview = serde_json::to_string(value).ok().map(|text| {
+        let bytes = text.as_bytes();
+        let mut trimmed = if bytes.len() > max_bytes as usize {
+            String::from_utf8_lossy(&bytes[..max_bytes as usize]).into_owned()
+        } else {
+            text
+        };
+        trimmed.push_str(" …[truncated]");
+        trimmed
+    });
+    Some(serde_json::json!({
+        "truncated": true,
+        "message": format!(
+            "output truncated by Dynamic MCP: {bytes} bytes exceeds the {max_bytes} byte limit (max_output_tokens = {max_tokens})"
+        ),
+        "preview": preview,
+    }))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,6 +290,18 @@ pub struct ServerSummary {
     pub observed_state: LifecycleState,
     pub tool_count: u64,
     pub tools_stale: bool,
+    /// Total recorded tool calls for this server (durable usage memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_count: Option<u64>,
+    /// Total recorded failed tool calls for this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_count: Option<u64>,
+    /// Unix milliseconds of the last recorded tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_unix_ms: Option<u64>,
+    /// Project labels that connected to this server (most recent first).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +376,9 @@ pub struct HostStatus {
     pub control_endpoint_ready: bool,
     pub mcp_endpoint_ready: bool,
     pub shutting_down: bool,
+    /// Total recorded downstream tool calls across all servers.
+    #[serde(default)]
+    pub tool_calls_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +410,8 @@ pub struct BatchToolCall {
     pub arguments: Value,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub call_policy: CallPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +484,9 @@ pub enum ControlRequest {
     },
     ConnectServer {
         server_id: String,
+        /// Free-form project label stored in usage memory (optional).
+        #[serde(default)]
+        project: Option<String>,
     },
     DisconnectServer {
         server_id: String,
@@ -394,7 +499,10 @@ pub enum ControlRequest {
         server_id: String,
         tool_name: String,
         arguments: Value,
+        #[serde(default)]
         timeout_ms: Option<u64>,
+        #[serde(default)]
+        call_policy: CallPolicy,
     },
     CallTools {
         calls: Vec<BatchToolCall>,
@@ -482,9 +590,29 @@ mod tests {
 
     use super::{
         BatchToolCall, BatchToolCallOutcome, BatchToolCallResponse, BatchToolCallResult,
-        CONTROL_PROTOCOL_VERSION, ControlRequest, ControlRequestEnvelope, ControlResponseEnvelope,
-        RuntimeError, RuntimeErrorCode, ToolCallResult,
+        CONTROL_PROTOCOL_VERSION, CallPolicy, ControlRequest, ControlRequestEnvelope,
+        ControlResponseEnvelope, RuntimeError, RuntimeErrorCode, ToolCallResult, truncate_json,
     };
+
+    #[test]
+    fn truncate_json_returns_none_when_the_value_fits() {
+        let value = json!({"content": [{"type": "text", "text": "short"}]});
+        assert_eq!(truncate_json(&value, 10_000), None);
+    }
+
+    #[test]
+    fn truncate_json_replaces_oversized_values_with_a_notice() {
+        let value = json!({"blob": "x".repeat(10_000)});
+        let truncated = truncate_json(&value, 16).expect("oversized value should truncate");
+        assert_eq!(truncated["truncated"], true);
+        assert!(
+            truncated["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("max_output_tokens"))
+        );
+        let preview = truncated["preview"].as_str().expect("preview should exist");
+        assert!(preview.chars().count() <= 16 * 4 + " …[truncated]".len());
+    }
 
     #[test]
     fn runtime_error_codes_use_the_specified_wire_values() {
@@ -551,6 +679,16 @@ mod tests {
                 RuntimeErrorCode::SkillOutputTooLarge,
                 "SKILL_OUTPUT_TOO_LARGE",
             ),
+            (
+                RuntimeErrorCode::ResourcesNotSupported,
+                "RESOURCES_NOT_SUPPORTED",
+            ),
+            (
+                RuntimeErrorCode::PromptsNotSupported,
+                "PROMPTS_NOT_SUPPORTED",
+            ),
+            (RuntimeErrorCode::ResourceNotFound, "RESOURCE_NOT_FOUND"),
+            (RuntimeErrorCode::PromptNotFound, "PROMPT_NOT_FOUND"),
             (RuntimeErrorCode::ServiceForeign, "SERVICE_FOREIGN"),
             (
                 RuntimeErrorCode::ServicePermissionDenied,
@@ -583,6 +721,7 @@ mod tests {
                 tool_name: "read_file".to_owned(),
                 arguments: json!({"path": "notes/today.md"}),
                 timeout_ms: Some(1_000),
+                call_policy: CallPolicy::default(),
             },
         );
         let response = ControlResponseEnvelope::success("42", json!({"content": "ok"}));
@@ -609,6 +748,7 @@ mod tests {
                 tool_name: "append".to_owned(),
                 arguments: json!({"text": "first line\nsecond line"}),
                 timeout_ms: None,
+                call_policy: CallPolicy::default(),
             },
         );
 
@@ -628,12 +768,14 @@ mod tests {
                         tool_name: "echo".to_owned(),
                         arguments: json!({"value": 1}),
                         timeout_ms: Some(1_000),
+                        call_policy: CallPolicy::default(),
                     },
                     BatchToolCall {
                         server_id: "two".to_owned(),
                         tool_name: "missing".to_owned(),
                         arguments: json!({}),
                         timeout_ms: None,
+                        call_policy: CallPolicy::default(),
                     },
                 ],
             },
@@ -684,6 +826,28 @@ mod tests {
 
         assert_eq!(call.arguments, json!({}));
         assert_eq!(call.timeout_ms, None);
+        assert!(call.call_policy.auto_connect);
+        assert!(call.call_policy.auto_retry);
+        assert_eq!(call.call_policy.max_output_tokens, None);
+    }
+
+    #[test]
+    fn call_policy_accepts_missing_fields_from_older_clients() {
+        let request: ControlRequest = serde_json::from_value(json!({
+            "type": "call_tool",
+            "server_id": "fixture",
+            "tool_name": "echo",
+            "arguments": {}
+        }))
+        .expect("call_tool request without policy should deserialize");
+
+        match request {
+            ControlRequest::CallTool { call_policy, .. } => {
+                assert!(call_policy.auto_connect);
+                assert!(call_policy.auto_retry);
+            }
+            _ => panic!("expected CallTool request"),
+        }
     }
 
     #[test]
@@ -694,6 +858,7 @@ mod tests {
             tool_name: "search".to_owned(),
             arguments: json!({"query": secret_argument}),
             timeout_ms: None,
+            call_policy: CallPolicy::default(),
         };
         let error = RuntimeError::for_server(
             RuntimeErrorCode::ToolCallFailed,

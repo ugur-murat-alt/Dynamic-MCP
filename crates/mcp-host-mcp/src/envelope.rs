@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use mcp_host_core::RuntimeError;
+use mcp_host_core::{RuntimeError, ToolSuggestion};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -46,6 +46,10 @@ pub struct HostToolError {
     pub code: String,
     pub retryable: bool,
     pub server_id: Option<String>,
+    /// Close-name candidates for misspelled tools, when the runtime computed them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub suggestions: Option<Vec<ToolSuggestion>>,
 }
 
 impl From<&RuntimeError> for HostToolErrorEnvelope {
@@ -58,6 +62,7 @@ impl From<&RuntimeError> for HostToolErrorEnvelope {
                 code: error.code.as_str().to_owned(),
                 retryable: error.retryable,
                 server_id: error.server_id.clone(),
+                suggestions: error.suggestions.as_deref().cloned(),
             },
         }
     }
@@ -80,6 +85,7 @@ mod tests {
     use serde_json::{json, to_value};
 
     use super::{HOST_TOOL_SCHEMA_VERSION, HostToolEnvelope, HostToolErrorEnvelope, output_schema};
+    use mcp_host_core::ToolSuggestion;
 
     #[test]
     fn success_envelope_has_a_stable_machine_shape() {
@@ -114,8 +120,33 @@ mod tests {
         assert_eq!(value["error"]["server_id"], "fixture");
         assert!(value.get("message").is_none());
         assert!(value.get("source_summary").is_none());
+        assert!(value["error"].get("suggestions").is_none());
         assert!(!value.to_string().contains("secret argument"));
         assert!(!value.to_string().contains("sensitive stderr"));
+    }
+
+    #[test]
+    fn error_envelope_carries_close_name_suggestions_when_present() {
+        let error = RuntimeError::for_server(
+            RuntimeErrorCode::ToolNotFound,
+            "call_tool",
+            "fixture",
+            "the requested tool was not discovered",
+        )
+        .with_suggestions(vec![ToolSuggestion {
+            server_id: "fixture".to_owned(),
+            tool_name: "echo".to_owned(),
+            description: Some("Return the supplied message.".to_owned()),
+        }]);
+        let value =
+            to_value(HostToolErrorEnvelope::from(&error)).expect("error envelope should serialize");
+
+        assert_eq!(value["error"]["suggestions"][0]["tool_name"], "echo");
+        assert_eq!(value["error"]["suggestions"][0]["server_id"], "fixture");
+        assert_eq!(
+            value["error"]["suggestions"][0]["description"],
+            "Return the supplied message."
+        );
     }
 
     #[test]

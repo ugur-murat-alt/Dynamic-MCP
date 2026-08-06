@@ -8,7 +8,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mcp_host_core::{BatchToolCall, HostStatus, RuntimeError, RuntimeErrorCode};
+use mcp_host_core::{
+    BatchToolCall, CallPolicy, HostStatus, RuntimeError, RuntimeErrorCode, ToolDefinition,
+};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -25,7 +27,7 @@ use crate::{
 };
 
 const SERVER_DESCRIPTION: &str = "A long-running MCP runtime and process manager that presents one stable MCP server to AI clients while managing manifest-defined MCP servers as downstream clients.";
-const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers.\n2. Call inspect_server to review a server's public configuration and current state.\n3. Call connect_server before using a disconnected server.\n4. Call list_tools after connecting to discover that server's available tools.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations.\n6. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.\n7. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.\n8. For call_tool and successful call_tools items, also inspect the downstream isError field.";
+const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers; use_count and projects show usage memory.\n2. Call find_tool to search tool names across servers, or inspect_server to review a server's public configuration and state.\n3. connect_server is only needed for non-call operations: call_tool auto-connects registered servers by default.\n4. Call list_tools (detail \"summary\" for compact entries) to discover exact tool names and schemas.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations; both auto-refresh stale caches and suggest close names on TOOL_NOT_FOUND.\n6. For servers that advertise them, use list_resources/read_resource and list_prompts/call_prompt.\n7. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.\n8. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.\n9. For call_tool and successful call_tools items, also inspect the downstream isError field.";
 
 /// Shared process state owned by the daemon hosting inbound MCP sessions.
 pub struct HostRuntimeState {
@@ -91,6 +93,7 @@ impl HostRuntimeState {
             control_endpoint_ready: self.control_ready.load(Ordering::Acquire),
             mcp_endpoint_ready: self.mcp_ready.load(Ordering::Acquire),
             shutting_down: self.shutting_down.load(Ordering::Acquire),
+            tool_calls_total: runtime.total_tool_calls().await,
         }
     }
 }
@@ -158,10 +161,44 @@ struct ServerIdParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct ConnectParams {
+    server_id: String,
+    /// Free-form project label stored in usage memory (optional).
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FindToolParams {
+    query: String,
+    #[serde(default)]
+    server_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReadResourceParams {
+    server_id: String,
+    uri: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct CallPromptParams {
+    server_id: String,
+    prompt_name: String,
+    #[serde(default)]
+    arguments: Map<String, Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ListToolsParams {
     server_id: String,
     #[serde(default)]
     refresh: bool,
+    /// "summary" returns names and truncated one-line descriptions only; "full" (default) returns complete schemas.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[derive(JsonSchema)]
@@ -170,6 +207,12 @@ struct CallToolParams {
     tool_name: String,
     arguments: Map<String, Value>,
     timeout_ms: Option<u64>,
+    /// Connects a registered but disconnected server before calling (default true).
+    auto_connect: Option<bool>,
+    /// Recovers from TOOL_NOT_FOUND/TOOLS_NOT_DISCOVERED with one refresh-retry pass (default true).
+    auto_retry: Option<bool>,
+    /// Soft ceiling for the serialized result in tokens (4 bytes per token); over-sized output is replaced by a truncation notice.
+    max_output_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +223,12 @@ struct CallToolParamsWire {
     arguments: Map<String, Value>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    auto_connect: Option<bool>,
+    #[serde(default)]
+    auto_retry: Option<bool>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for CallToolParams {
@@ -193,6 +242,9 @@ impl<'de> Deserialize<'de> for CallToolParams {
             tool_name: wire.tool_name,
             arguments: wire.arguments,
             timeout_ms: wire.timeout_ms,
+            auto_connect: wire.auto_connect,
+            auto_retry: wire.auto_retry,
+            max_output_tokens: wire.max_output_tokens,
         })
     }
 }
@@ -210,6 +262,12 @@ struct BatchToolCallParams {
     arguments: Map<String, Value>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Connects a registered but disconnected server before calling (default true).
+    auto_connect: Option<bool>,
+    /// Recovers from TOOL_NOT_FOUND/TOOLS_NOT_DISCOVERED with one refresh-retry pass (default true).
+    auto_retry: Option<bool>,
+    /// Soft ceiling for this item's serialized result in tokens (4 bytes per token).
+    max_output_tokens: Option<u64>,
 }
 
 #[tool_router]
@@ -243,14 +301,16 @@ impl HostMcpServer {
         )
     }
 
-    #[tool(description = "Connect to a downstream MCP server and discover its tools.")]
+    #[tool(
+        description = "Connect to a downstream MCP server and discover its tools. An optional project label is stored in usage memory so later sessions remember which projects use this server."
+    )]
     async fn connect_server(
         &self,
-        Parameters(ServerIdParams { server_id }): Parameters<ServerIdParams>,
+        Parameters(ConnectParams { server_id, project }): Parameters<ConnectParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let connection = self
             .runtime
-            .connect_server(&server_id)
+            .connect_server(&server_id, project.as_deref())
             .await
             .map_err(runtime_error)?;
         structured_result(
@@ -278,21 +338,49 @@ impl HostMcpServer {
     }
 
     #[tool(
-        description = "List cached tools for a downstream MCP server, optionally refreshing first."
+        description = "List cached tools for a downstream MCP server, optionally refreshing first. Use detail = \"summary\" for compact name+description entries and detail = \"full\" for complete schemas."
     )]
     async fn list_tools(
         &self,
-        Parameters(ListToolsParams { server_id, refresh }): Parameters<ListToolsParams>,
+        Parameters(ListToolsParams {
+            server_id,
+            refresh,
+            detail,
+        }): Parameters<ListToolsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let tools = self
+        let mut tools = self
             .runtime
             .list_tools(&server_id, refresh)
             .await
             .map_err(runtime_error)?;
+        if detail.as_deref() == Some("summary") {
+            tools.tools = tools
+                .tools
+                .into_iter()
+                .map(|tool| ToolDefinition {
+                    name: tool.name,
+                    title: tool.title,
+                    description: tool.description.map(|text| {
+                        let mut truncated: String = text.chars().take(120).collect();
+                        if text.chars().count() > 120 {
+                            truncated.push('…');
+                        }
+                        truncated
+                    }),
+                    input_schema: Value::Null,
+                    output_schema: None,
+                    annotations: None,
+                    icons: None,
+                    meta: None,
+                })
+                .collect();
+        }
         structured_result("list_tools", tools, "Listed downstream MCP tools.")
     }
 
-    #[tool(description = "Call a discovered tool on a connected downstream MCP server.")]
+    #[tool(
+        description = "Call a discovered tool on a downstream MCP server. A registered but disconnected server is connected automatically, and a stale tool cache is refreshed and retried once before reporting TOOL_NOT_FOUND with close-name suggestions."
+    )]
     async fn call_tool(
         &self,
         Parameters(CallToolParams {
@@ -300,18 +388,32 @@ impl HostMcpServer {
             tool_name,
             arguments,
             timeout_ms,
+            auto_connect,
+            auto_retry,
+            max_output_tokens,
         }): Parameters<CallToolParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let call_policy = CallPolicy {
+            auto_connect: auto_connect.unwrap_or(true),
+            auto_retry: auto_retry.unwrap_or(true),
+            max_output_tokens,
+        };
         let result = self
             .runtime
-            .call_tool(&server_id, &tool_name, Value::Object(arguments), timeout_ms)
+            .call_tool(
+                &server_id,
+                &tool_name,
+                Value::Object(arguments),
+                timeout_ms,
+                call_policy,
+            )
             .await
             .map_err(runtime_error)?;
         routed_downstream_result(server_id, tool_name, result.into_value())
     }
 
     #[tool(
-        description = "Call between 1 and 32 discovered tools concurrently. Results preserve input order; item runtime errors are embedded without cancelling other calls."
+        description = "Call between 1 and 32 discovered tools concurrently. Results preserve input order; item runtime errors are embedded without cancelling other calls. Each item auto-connects its server and auto-refreshes stale tool caches."
     )]
     async fn call_tools(
         &self,
@@ -324,6 +426,11 @@ impl HostMcpServer {
                 tool_name: call.tool_name,
                 arguments: Value::Object(call.arguments),
                 timeout_ms: call.timeout_ms,
+                call_policy: CallPolicy {
+                    auto_connect: call.auto_connect.unwrap_or(true),
+                    auto_retry: call.auto_retry.unwrap_or(true),
+                    max_output_tokens: call.max_output_tokens,
+                },
             })
             .collect();
         let response = self
@@ -336,6 +443,29 @@ impl HostMcpServer {
             response.results.len()
         );
         structured_result("call_tools", response, &text)
+    }
+
+    #[tool(
+        description = "Search cached downstream tool definitions by name. Exact matches rank first, then prefixes, then substrings. Returns the server owning each tool so you can call it with call_tool."
+    )]
+    async fn find_tool(
+        &self,
+        Parameters(FindToolParams {
+            query,
+            server_id,
+            limit,
+        }): Parameters<FindToolParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let matches = self
+            .runtime
+            .search_tools(&query, server_id.as_deref(), limit.unwrap_or(8))
+            .await;
+        let text = if matches.is_empty() {
+            "No cached downstream tools matched the query."
+        } else {
+            "Searched cached downstream tool definitions."
+        };
+        structured_result("find_tool", json!({ "matches": matches }), text)
     }
 
     #[tool(description = "Return Dynamic MCP Host process and downstream runtime status.")]
@@ -357,6 +487,70 @@ impl HostMcpServer {
             .await
             .map_err(runtime_error)?;
         structured_result("refresh_server", tools, "Refreshed downstream MCP tools.")
+    }
+
+    #[tool(
+        description = "List resources advertised by a connected downstream MCP server (for example file:// contents)."
+    )]
+    async fn list_resources(
+        &self,
+        Parameters(ServerIdParams { server_id }): Parameters<ServerIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let resources = self
+            .runtime
+            .list_resources(&server_id)
+            .await
+            .map_err(runtime_error)?;
+        structured_result(
+            "list_resources",
+            resources,
+            "Listed downstream MCP resources.",
+        )
+    }
+
+    #[tool(description = "Read one resource from a connected downstream MCP server.")]
+    async fn read_resource(
+        &self,
+        Parameters(ReadResourceParams { server_id, uri }): Parameters<ReadResourceParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let resource = self
+            .runtime
+            .read_resource(&server_id, &uri)
+            .await
+            .map_err(runtime_error)?;
+        structured_result("read_resource", resource, "Read downstream MCP resource.")
+    }
+
+    #[tool(description = "List reusable prompts advertised by a connected downstream MCP server.")]
+    async fn list_prompts(
+        &self,
+        Parameters(ServerIdParams { server_id }): Parameters<ServerIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let prompts = self
+            .runtime
+            .list_prompts(&server_id)
+            .await
+            .map_err(runtime_error)?;
+        structured_result("list_prompts", prompts, "Listed downstream MCP prompts.")
+    }
+
+    #[tool(
+        description = "Invoke a prompt on a connected downstream MCP server with object arguments."
+    )]
+    async fn call_prompt(
+        &self,
+        Parameters(CallPromptParams {
+            server_id,
+            prompt_name,
+            arguments,
+        }): Parameters<CallPromptParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = self
+            .runtime
+            .call_prompt(&server_id, &prompt_name, arguments)
+            .await
+            .map_err(runtime_error)?;
+        structured_result("call_prompt", result, "Invoked downstream MCP prompt.")
     }
 }
 
@@ -412,7 +606,7 @@ fn decode_downstream_result(value: Value) -> Result<CallToolResult, ErrorData> {
     serde_json::from_value(value).map_err(|_| serialization_error())
 }
 
-fn runtime_error(error: RuntimeError) -> ErrorData {
+pub(crate) fn runtime_error(error: RuntimeError) -> ErrorData {
     let data = match serde_json::to_value(HostToolErrorEnvelope::from(&error)) {
         Ok(data) => data,
         Err(_) => return serialization_error(),
@@ -468,13 +662,18 @@ mod tests {
         assert_eq!(
             server.tool_names(),
             [
+                "call_prompt",
                 "call_tool",
                 "call_tools",
                 "connect_server",
                 "disconnect_server",
+                "find_tool",
                 "inspect_server",
+                "list_prompts",
+                "list_resources",
                 "list_servers",
                 "list_tools",
+                "read_resource",
                 "refresh_server",
                 "status",
             ]

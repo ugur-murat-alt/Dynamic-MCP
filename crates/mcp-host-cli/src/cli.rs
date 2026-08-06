@@ -39,25 +39,31 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Start, inspect, or stop the foreground daemon.
+    #[command(alias = "d")]
     Daemon(Daemon),
     /// List every server in the immutable registry.
+    #[command(alias = "ls")]
     List,
     /// Show manifest, lifecycle, and cached-tool details for one server.
+    #[command(alias = "i")]
     Inspect {
         /// Registry ID of the server to inspect.
         server_id: String,
     },
     /// Establish an upstream MCP session and discover its tools.
+    #[command(alias = "c")]
     Connect {
         /// Registry ID of the server to connect.
         server_id: String,
     },
     /// Close an upstream MCP session and reap its child process.
+    #[command(alias = "dc")]
     Disconnect {
         /// Registry ID of the server to disconnect.
         server_id: String,
     },
     /// List the cached tools exposed by a connected upstream server.
+    #[command(alias = "t")]
     Tools {
         /// Registry ID of the connected server.
         server_id: String,
@@ -66,32 +72,57 @@ pub enum Command {
         refresh: bool,
     },
     /// Atomically refresh one connected server's tool snapshot.
+    #[command(alias = "rf")]
     Refresh {
         /// Registry ID of the connected server.
         server_id: String,
     },
     /// Invoke one tool on an already connected upstream server.
+    #[command(alias = "ca")]
     Call(Call),
     /// Invoke up to 32 connected upstream tools concurrently.
     #[command(
+        alias = "b",
         long_about = "Invoke between 1 and 32 tools concurrently across connected downstream MCP servers.\n\nResults preserve input order. A runtime error for one item is embedded in that item and does not cancel the remaining calls. Upstream MCP results, including isError, structuredContent, and _meta, are preserved."
     )]
     Batch(Batch),
     /// Show daemon health and aggregate runtime state.
-    Status,
+    #[command(alias = "st")]
+    Status(StatusArgs),
     /// Log in, inspect, or log out an OAuth-enabled HTTP server.
+    #[command(alias = "a")]
     Auth(Auth),
     /// List or run deterministic runtime skills.
+    #[command(alias = "sk")]
     Skill(Skill),
     /// Explicitly install a downstream package declared by a server manifest.
+    #[command(alias = "pkg")]
     Package(Package),
     /// Register the stdio bridge in a supported AI coding harness.
+    #[command(alias = "h")]
     Harness(Harness),
     /// Bridge stdin/stdout to the daemon's raw MCP endpoint.
     #[command(
-        long_about = "Bridge stdin/stdout to the daemon's raw MCP endpoint.\n\nThis command is intended to be launched by an MCP client. The daemon must already be running. Stdout is reserved exclusively for MCP protocol bytes; diagnostics are written to stderr."
+        long_about = "Bridge stdin/stdout to the daemon's raw MCP endpoint.\n\nThis command is intended to be launched by an MCP client. The daemon must already be running. Stdout is reserved exclusively for MCP protocol bytes; diagnostics are written to stderr. Use --endpoint to reach a per-server proxy socket instead of the default aggregate endpoint."
     )]
-    Mcp,
+    Mcp(McpArgs),
+    /// Start an interactive terminal session with tab completion.
+    #[command(
+        long_about = "Start an interactive terminal session with tab completion.\n\nThe session reuses the same commands as the one-shot CLI. Tab completes command names, aliases, registered server IDs, discovered tool names, and common flags. `help` lists available commands; `exit` or Ctrl-D ends the session. When stdin is not a terminal, lines are read one at a time so the session can be scripted."
+    )]
+    Shell,
+    /// Print a shell completion script for the current binary.
+    #[command(
+        long_about = "Print a shell completion script for the current binary.\n\nUsage:\n  mcp-host completions bash  > ~/.bash_completion.d/mcp-host\n  mcp-host completions zsh   > \"$(brew --prefix)/share/zsh/site-functions/_mcp-host\"\n  mcp-host completions fish  > ~/.config/fish/completions/mcp-host.fish\n  mcp-host completions powershell > $PROFILE"
+    )]
+    Completions(Completions),
+    /// Inspect the installation, daemon, and configuration health.
+    Doctor,
+    /// Scaffold a starter configuration directory.
+    #[command(
+        long_about = "Scaffold a starter configuration directory.\n\nWrites a sample server manifest, a policy file, and a short README into the target directory. Existing files are never overwritten unless --force is given."
+    )]
+    Init(Init),
 }
 
 #[derive(Debug, Args)]
@@ -252,6 +283,34 @@ pub struct DaemonRun {
     /// Directory containing server manifest TOML files.
     #[arg(long, value_name = "DIR")]
     pub config_dir: PathBuf,
+
+    /// Register a per-server MCP proxy with a running `opencode serve` instance.
+    #[arg(long, value_name = "URL", value_parser = parse_http_url)]
+    pub opencode_serve_url: Option<String>,
+}
+
+/// Arguments used by the stdio bridge.
+#[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Connect to this endpoint path instead of the default runtime MCP socket.
+    #[arg(long, value_name = "PATH")]
+    pub endpoint: Option<PathBuf>,
+}
+
+fn parse_http_url(value: &str) -> Result<String, String> {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Ok(value.trim_end_matches('/').to_owned())
+    } else {
+        Err("expected an http:// or https:// URL".to_owned())
+    }
+}
+
+/// Optional flags for the status command.
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Also show per-server usage memory: call counts, failures, last use, and projects.
+    #[arg(long)]
+    pub stats: bool,
 }
 
 /// Arguments used to invoke a tool.
@@ -269,6 +328,18 @@ pub struct Call {
     /// Read the tool argument JSON object from a file, or `-` for stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "arguments")]
     pub arguments_file: Option<PathBuf>,
+
+    /// Disable implicit connection of a registered but disconnected server.
+    #[arg(long)]
+    pub no_auto_connect: bool,
+
+    /// Disable the single refresh-and-retry recovery pass for stale tool caches.
+    #[arg(long)]
+    pub no_retry: bool,
+
+    /// Soft ceiling for the serialized result in tokens (4 bytes per token); over-sized output is replaced by a truncation notice.
+    #[arg(long, value_name = "TOKENS")]
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Arguments used to invoke a bounded batch of tools concurrently.
@@ -382,6 +453,35 @@ fn parse_harness_name(value: &str) -> Result<String, String> {
     Ok(value.to_owned())
 }
 
+/// Shell completion script generation.
+#[derive(Debug, Args)]
+pub struct Completions {
+    /// Target shell.
+    #[arg(value_enum)]
+    pub shell: CompletionShell,
+}
+
+/// Shells supported by completion generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Powershell,
+    Elvish,
+}
+
+/// Starter configuration scaffolding.
+#[derive(Debug, Args)]
+pub struct Init {
+    /// Directory to scaffold; defaults to `./config`.
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+    /// Overwrite managed files that already exist.
+    #[arg(long)]
+    pub force: bool,
+}
+
 /// Process exit statuses exposed by the CLI.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,6 +569,28 @@ mod tests {
             ],
             &["mcp-host", "harness", "install", "all"],
             &["mcp-host", "mcp"],
+            &["mcp-host", "shell"],
+            &["mcp-host", "doctor"],
+            &["mcp-host", "init"],
+            &["mcp-host", "init", "--dir", "custom", "--force"],
+            &["mcp-host", "completions", "bash"],
+            &["mcp-host", "completions", "zsh"],
+            &["mcp-host", "completions", "fish"],
+            &["mcp-host", "completions", "powershell"],
+            &["mcp-host", "completions", "elvish"],
+            // Aliases
+            &["mcp-host", "ls"],
+            &["mcp-host", "i", "server-a"],
+            &["mcp-host", "c", "server-a"],
+            &["mcp-host", "dc", "server-a"],
+            &["mcp-host", "t", "server-a"],
+            &["mcp-host", "rf", "server-a"],
+            &["mcp-host", "ca", "server-a", "tool-a"],
+            &["mcp-host", "b", "--calls", "[]"],
+            &["mcp-host", "st"],
+            &["mcp-host", "sk", "list"],
+            &["mcp-host", "pkg", "install", "server-a"],
+            &["mcp-host", "d", "status"],
         ];
 
         for arguments in commands {

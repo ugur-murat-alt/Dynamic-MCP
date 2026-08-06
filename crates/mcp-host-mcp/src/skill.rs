@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use mcp_host_core::{
-    MAX_SKILL_STEPS, RuntimeError, RuntimeErrorCode, RuntimeSkill, SkillRunFailure, SkillRunResult,
-    SkillRunStatus, SkillStep, SkillStepResult, SkillTemplatePart, SkillTemplateReference,
-    ToolCallResult, parse_skill_template,
+    CallPolicy, MAX_SKILL_STEPS, RuntimeError, RuntimeErrorCode, RuntimeSkill, SkillRunFailure,
+    SkillRunResult, SkillRunStatus, SkillStep, SkillStepResult, SkillTemplatePart,
+    SkillTemplateReference, ToolCallResult, parse_skill_template,
 };
 use serde_json::{Map, Value};
 
@@ -53,6 +53,7 @@ impl SkillEngine {
                     step.tool_name(),
                     arguments,
                     step.timeout_ms(),
+                    CallPolicy::default(),
                 )
                 .await
             {

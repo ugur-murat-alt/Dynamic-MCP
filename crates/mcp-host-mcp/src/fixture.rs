@@ -5,7 +5,13 @@ use std::{fs, io, path::PathBuf, process, time::Duration};
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, InitializeRequestParams, ServerInfo},
+    model::{
+        CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
+        Implementation, InitializeRequestParams, ListPromptsResult, ListResourcesResult,
+        PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
+        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role,
+        ServerCapabilities, ServerInfo,
+    },
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
     transport::stdio,
@@ -158,6 +164,97 @@ impl ServerHandler for FixtureServer {
             _ = context.ct.cancelled() => Err(ErrorData::internal_error("initialization cancelled", None)),
             _ = tokio::time::sleep(delay) => Ok(self.get_info()),
         }
+    }
+
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(Implementation::new(
+            "mcp-host-fixture-server",
+            env!("CARGO_PKG_VERSION"),
+        ))
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult {
+            resources: vec![
+                Resource::new("fixture://info", "fixture info")
+                    .with_description("Static fixture resource"),
+            ],
+            ..Default::default()
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != "fixture://info" {
+            return Err(ErrorData::resource_not_found(
+                "unknown fixture resource URI",
+                None,
+            ));
+        }
+        Ok(ReadResourceResponse::Complete(ReadResourceResult::new(
+            vec![ResourceContents::TextResourceContents {
+                uri: "fixture://info".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: "fixture information resource".to_owned(),
+                meta: None,
+            }],
+        )))
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult {
+            prompts: vec![Prompt::new(
+                "greet",
+                Some("Greet a person by name"),
+                Some(vec![
+                    PromptArgument::new("name")
+                        .with_description("The person to greet")
+                        .with_required(true),
+                ]),
+            )],
+            ..Default::default()
+        })
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        if request.name != "greet" {
+            return Err(ErrorData::new(
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "unknown fixture prompt name",
+                None,
+            ));
+        }
+        let name = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("world");
+        Ok(GetPromptResponse::Complete(GetPromptResult::new(vec![
+            PromptMessage::new_text(Role::User, format!("Hello, {name}!")),
+        ])))
     }
 }
 

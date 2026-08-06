@@ -1,7 +1,7 @@
 //! Runtime management for outbound MCP client sessions.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     process::Stdio,
     sync::{
         Arc, Weak,
@@ -14,12 +14,13 @@ use futures_util::future::join_all;
 use http::{HeaderName, HeaderValue};
 use mcp_host_core::{
     AuthLoginStartResult, AuthStatusResult, BatchToolCall, BatchToolCallOutcome,
-    BatchToolCallResponse, BatchToolCallResult, ConnectDisposition, ConnectResult,
+    BatchToolCallResponse, BatchToolCallResult, CallPolicy, ConnectDisposition, ConnectResult,
     DesiredConnection, DisconnectDisposition, DisconnectResult, Lifecycle, LifecycleState,
     MAX_BATCH_CALLS, McpServerRegistry, PackageInstallResult, Policy, PolicyAction, PolicyDecision,
     ReconnectConfig, RegisteredServer, ResolvedTransportConfig, RuntimeError, RuntimeErrorCode,
     ServerId, ServerInspection, ServerSummary, SkillCatalog, SkillRunResult, SkillRunStatus,
-    SkillSummary, ToolCallResult, ToolDefinition, ToolSnapshot, TransportKind,
+    SkillSummary, ToolCallResult, ToolDefinition, ToolSnapshot, ToolSuggestion, TransportKind,
+    truncate_json,
 };
 use process_wrap::tokio::CommandWrap;
 #[cfg(windows)]
@@ -31,13 +32,14 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{
     ClientHandler, Peer, ServiceError, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, ClientInfo, ClientRequest, ProtocolVersion,
-        ServerInfo, ServerResult, Tool,
+        CallToolRequest, CallToolRequestParams, ClientInfo, ClientRequest, GetPromptRequestParams,
+        ProtocolVersion, ReadResourceRequestParams, ServerInfo, ServerResult, Tool,
     },
     service::{PeerRequestOptions, RoleClient, RunningService},
     transport::{StreamableHttpClientTransport, TokioChildProcess},
 };
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use tokio::{
     io::AsyncReadExt,
     sync::{Mutex, Notify, RwLock},
@@ -49,6 +51,147 @@ use tokio_util::sync::CancellationToken;
 use crate::{auth::ServerAuth, package::PackageInstaller, skill::SkillEngine};
 
 static NEXT_INVOCATION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Durable, per-server usage memory.
+///
+/// Aggregates in memory and appends one JSONL event per tool call when a
+/// journal root is configured, so a restarted daemon remembers which servers
+/// a project has used.
+#[derive(Debug, Default)]
+struct UsageTracker {
+    inner: RwLock<BTreeMap<String, ServerUsage>>,
+    journal: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ServerUsage {
+    call_count: u64,
+    error_count: u64,
+    last_used_at_unix_ms: Option<u64>,
+    projects: BTreeSet<String>,
+}
+
+impl UsageTracker {
+    fn load(root: Option<&std::path::Path>) -> Self {
+        let journal = root.map(|directory| directory.join("usage.jsonl"));
+        let mut inner: BTreeMap<String, ServerUsage> = BTreeMap::new();
+        if let Some(path) = &journal
+            && let Ok(lines) = std::fs::read_to_string(path)
+        {
+            for line in lines.lines() {
+                let Ok(event) = serde_json::from_str::<UsageEvent>(line) else {
+                    continue;
+                };
+                let usage = inner.entry(event.server_id.clone()).or_default();
+                if event.kind == UsageKind::Call {
+                    usage.call_count = usage.call_count.saturating_add(1);
+                    if !event.success {
+                        usage.error_count = usage.error_count.saturating_add(1);
+                    }
+                    if usage.last_used_at_unix_ms.is_none_or(|ts| event.ts > ts) {
+                        usage.last_used_at_unix_ms = Some(event.ts);
+                    }
+                }
+                if let Some(project) = event.project {
+                    usage.projects.insert(project);
+                }
+                while usage.projects.len() > MAX_TRACKED_PROJECTS {
+                    usage.projects.pop_first();
+                }
+            }
+        }
+        Self {
+            inner: RwLock::new(inner),
+            journal,
+        }
+    }
+
+    async fn record_call(&self, server_id: &str, success: bool) {
+        self.append(UsageEvent {
+            ts: unix_ms(),
+            kind: UsageKind::Call,
+            server_id: server_id.to_owned(),
+            success,
+            project: None,
+        })
+        .await;
+    }
+
+    async fn record_project(&self, server_id: &str, project: &str) {
+        self.append(UsageEvent {
+            ts: unix_ms(),
+            kind: UsageKind::Connect,
+            server_id: server_id.to_owned(),
+            success: true,
+            project: Some(project.to_owned()),
+        })
+        .await;
+    }
+
+    async fn append(&self, event: UsageEvent) {
+        {
+            let mut inner = self.inner.write().await;
+            let usage = inner.entry(event.server_id.clone()).or_default();
+            if event.kind == UsageKind::Call {
+                usage.call_count = usage.call_count.saturating_add(1);
+                if !event.success {
+                    usage.error_count = usage.error_count.saturating_add(1);
+                }
+                usage.last_used_at_unix_ms = Some(event.ts);
+            }
+            if let Some(project) = &event.project {
+                usage.projects.insert(project.clone());
+                while usage.projects.len() > MAX_TRACKED_PROJECTS {
+                    usage.projects.pop_first();
+                }
+            }
+        }
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let Some(line) = serde_json::to_string(&event).ok() else {
+            return;
+        };
+        let journal = journal.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = journal.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&journal)
+            {
+                let _ = writeln!(file, "{line}");
+            }
+        })
+        .await;
+    }
+
+    async fn snapshot(&self) -> BTreeMap<String, ServerUsage> {
+        self.inner.read().await.clone()
+    }
+}
+
+const MAX_TRACKED_PROJECTS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UsageKind {
+    Call,
+    Connect,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UsageEvent {
+    ts: u64,
+    kind: UsageKind,
+    server_id: String,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
 
 /// Runtime limits for downstream MCP servers.
 #[derive(Debug, Clone)]
@@ -67,6 +210,8 @@ pub struct RuntimeSettings {
     pub package_root: Option<std::path::PathBuf>,
     /// Root directory for persistent OAuth credentials.
     pub auth_root: Option<std::path::PathBuf>,
+    /// Root directory for the durable usage journal (`usage.jsonl`).
+    pub usage_root: Option<std::path::PathBuf>,
 }
 
 impl Default for RuntimeSettings {
@@ -79,6 +224,7 @@ impl Default for RuntimeSettings {
             stderr_tail_bytes: 8_192,
             package_root: None,
             auth_root: None,
+            usage_root: None,
         }
     }
 }
@@ -102,6 +248,7 @@ pub struct RuntimeManager {
     server_count: AtomicU64,
     shutdown: CancellationToken,
     package_installer: Option<PackageInstaller>,
+    usage: UsageTracker,
 }
 
 struct RuntimeCatalog {
@@ -159,6 +306,7 @@ impl RuntimeManager {
             })
             .collect();
         let server_count = servers.len() as u64;
+        let usage = UsageTracker::load(settings.usage_root.as_deref());
         Arc::new(Self {
             catalog: RwLock::new(RuntimeCatalog {
                 registry,
@@ -171,6 +319,7 @@ impl RuntimeManager {
             server_count: AtomicU64::new(server_count),
             shutdown,
             package_installer,
+            usage,
         })
     }
 
@@ -293,17 +442,38 @@ impl RuntimeManager {
         }
     }
 
-    /// Lists servers in normalized ID order.
+    /// Lists servers in normalized ID order, merged with durable usage memory.
     pub async fn list_servers(&self) -> Vec<ServerSummary> {
         let servers = self.runtimes().await;
         let policy = self.policy().await;
+        let usage = self.usage.snapshot().await;
         let futures = servers
             .iter()
             .filter(|runtime| {
                 policy.check(PolicyAction::List, &runtime.id, None) == PolicyDecision::Allow
             })
-            .map(|runtime| runtime.summary());
+            .map(|runtime| {
+                let usage = usage.get(&runtime.id).cloned().unwrap_or_default();
+                async move {
+                    let mut summary = runtime.summary().await;
+                    summary.use_count = Some(usage.call_count);
+                    summary.error_count = Some(usage.error_count);
+                    summary.last_used_at_unix_ms = usage.last_used_at_unix_ms;
+                    summary.projects = usage.projects.into_iter().rev().collect::<Vec<_>>();
+                    summary
+                }
+            });
         join_all(futures).await
+    }
+
+    /// Total recorded downstream tool calls across all servers.
+    pub async fn total_tool_calls(&self) -> u64 {
+        self.usage
+            .snapshot()
+            .await
+            .values()
+            .map(|usage| usage.call_count)
+            .sum()
     }
 
     /// Returns public, secret-free metadata and current runtime state for a server.
@@ -315,12 +485,24 @@ impl RuntimeManager {
     }
 
     /// Connects, initializes, and discovers all tools for a server.
-    pub async fn connect_server(&self, server_id: &str) -> Result<ConnectResult, RuntimeError> {
+    ///
+    /// When `project` is supplied, the association is stored in durable usage
+    /// memory so later sessions can see which projects used this server.
+    pub async fn connect_server(
+        &self,
+        server_id: &str,
+        project: Option<&str>,
+    ) -> Result<ConnectResult, RuntimeError> {
         let started = Instant::now();
         let runtime = self.server(server_id, "connect_server").await?;
         self.authorize(PolicyAction::Connect, &runtime.id, None, "connect_server")
             .await?;
         let result = runtime.connect().await;
+        if result.is_ok()
+            && let Some(project) = project
+        {
+            self.usage.record_project(server_id, project).await;
+        }
         trace_operation("connect_server", server_id, started, &result);
         result
     }
@@ -380,12 +562,17 @@ impl RuntimeManager {
     }
 
     /// Calls a discovered tool with object arguments.
+    ///
+    /// Applies [`CallPolicy`]: implicit connection, a single refresh-retry
+    /// recovery pass, did-you-mean suggestions for persistent misses, and an
+    /// optional output token budget. Records usage memory for the server.
     pub async fn call_tool(
         &self,
         server_id: &str,
         tool_name: &str,
         arguments: Value,
         timeout_ms: Option<u64>,
+        policy: CallPolicy,
     ) -> Result<ToolCallResult, RuntimeError> {
         let started = Instant::now();
         let invocation_id = NEXT_INVOCATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -398,7 +585,58 @@ impl RuntimeManager {
             "call_tool",
         )
         .await?;
-        let result = runtime.call_tool(tool_name, arguments, timeout_ms).await;
+        if !arguments.is_object() {
+            return Err(RuntimeError::new(
+                RuntimeErrorCode::InvalidArguments,
+                "call_tool",
+                "tool arguments must be a JSON object",
+            ));
+        }
+        if policy.auto_connect && runtime.state().await != LifecycleState::Connected {
+            self.authorize(PolicyAction::Connect, &runtime.id, None, "auto_connect")
+                .await?;
+            runtime.connect().await?;
+        }
+        let mut result = runtime
+            .call_tool(tool_name, arguments.clone(), timeout_ms)
+            .await;
+        if policy.auto_retry
+            && matches!(
+                result,
+                Err(RuntimeError {
+                    code: RuntimeErrorCode::ToolNotFound | RuntimeErrorCode::ToolsNotDiscovered,
+                    ..
+                })
+            )
+        {
+            if runtime.refresh().await.is_ok() {
+                result = runtime
+                    .call_tool(tool_name, arguments.clone(), timeout_ms)
+                    .await;
+            }
+            if let Err(RuntimeError {
+                code: RuntimeErrorCode::ToolNotFound,
+                ..
+            }) = &result
+            {
+                let suggestions = self
+                    .search_tools(tool_name, Some(&runtime.id), MAX_TOOL_SUGGESTIONS)
+                    .await;
+                if !suggestions.is_empty() {
+                    result = result.map_err(|error| {
+                        error.with_suggestions(suggestions).with_source_summary(
+                            "tool was refreshed and retried once before suggesting close names",
+                        )
+                    });
+                }
+            }
+        }
+        if let Ok(call) = &result
+            && let Some(max_tokens) = policy.max_output_tokens
+            && let Some(truncated) = truncate_json(call.value(), max_tokens)
+        {
+            result = Ok(ToolCallResult::new(truncated));
+        }
         let result_bytes = result
             .as_ref()
             .ok()
@@ -417,9 +655,76 @@ impl RuntimeManager {
             result_bytes,
             duration_ms = duration_ms(started.elapsed()),
             success = result.is_ok(),
+            auto_connect = policy.auto_connect,
+            auto_retry = policy.auto_retry,
             error_code
         );
+        self.usage.record_call(&runtime.id, result.is_ok()).await;
         result
+    }
+
+    /// Searches cached tool definitions across managed servers.
+    ///
+    /// Exact names rank first, then prefixes, then substrings, then
+    /// multi-word containment. Results respect the list policy.
+    pub async fn search_tools(
+        &self,
+        query: &str,
+        server_id: Option<&str>,
+        limit: usize,
+    ) -> Vec<ToolSuggestion> {
+        let normalized = normalize_query(query);
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+        let (servers, policy) = {
+            let catalog = self.catalog.read().await;
+            (
+                catalog.servers.values().cloned().collect::<Vec<_>>(),
+                Arc::clone(&catalog.policy),
+            )
+        };
+        let mut matches = Vec::new();
+        for runtime in servers {
+            if let Some(scope) = server_id
+                && runtime.id != scope
+            {
+                continue;
+            }
+            if policy.check(PolicyAction::List, &runtime.id, None) != PolicyDecision::Allow {
+                continue;
+            }
+            let Some(tools) = runtime.cached_tool_names().await else {
+                continue;
+            };
+            for (name, description) in tools {
+                if let Some(score) = score_tool_name(&normalized, &name) {
+                    matches.push((
+                        score,
+                        name.clone(),
+                        ToolSuggestion {
+                            server_id: runtime.id.clone(),
+                            tool_name: name,
+                            description: description.map(|text| {
+                                let mut truncated: String = text.chars().take(200).collect();
+                                if text.chars().count() > 200 {
+                                    truncated.push('…');
+                                }
+                                truncated
+                            }),
+                        },
+                    ));
+                }
+            }
+        }
+        matches.sort_by(|(a_score, a_name, _), (b_score, b_name, _)| {
+            a_score.cmp(b_score).then_with(|| a_name.cmp(b_name))
+        });
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, suggestion)| suggestion)
+            .collect()
     }
 
     /// Calls up to 32 discovered tools concurrently while preserving input order.
@@ -441,9 +746,10 @@ impl RuntimeManager {
                 tool_name,
                 arguments,
                 timeout_ms,
+                call_policy,
             } = call;
             let outcome = match self
-                .call_tool(&server_id, &tool_name, arguments, timeout_ms)
+                .call_tool(&server_id, &tool_name, arguments, timeout_ms, call_policy)
                 .await
             {
                 Ok(result) => BatchToolCallOutcome::Success { result },
@@ -458,6 +764,57 @@ impl RuntimeManager {
         .await;
 
         Ok(BatchToolCallResponse { results })
+    }
+
+    /// Lists runtime resources advertised by a connected server.
+    pub async fn list_resources(&self, server_id: &str) -> Result<Value, RuntimeError> {
+        let runtime = self.server(server_id, "list_resources").await?;
+        self.authorize(PolicyAction::List, &runtime.id, None, "list_resources")
+            .await?;
+        runtime.list_resources().await
+    }
+
+    /// Reads one resource from a connected server.
+    pub async fn read_resource(&self, server_id: &str, uri: &str) -> Result<Value, RuntimeError> {
+        let runtime = self.server(server_id, "read_resource").await?;
+        self.authorize(PolicyAction::List, &runtime.id, None, "read_resource")
+            .await?;
+        runtime.read_resource(uri).await
+    }
+
+    /// Lists prompts advertised by a connected server.
+    pub async fn list_prompts(&self, server_id: &str) -> Result<Value, RuntimeError> {
+        let runtime = self.server(server_id, "list_prompts").await?;
+        self.authorize(PolicyAction::List, &runtime.id, None, "list_prompts")
+            .await?;
+        runtime.list_prompts().await
+    }
+
+    /// Invokes a prompt on a connected server with object arguments.
+    pub async fn call_prompt(
+        &self,
+        server_id: &str,
+        prompt_name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<Value, RuntimeError> {
+        let runtime = self.server(server_id, "call_prompt").await?;
+        self.authorize(
+            PolicyAction::Call,
+            &runtime.id,
+            Some(prompt_name),
+            "call_prompt",
+        )
+        .await?;
+        runtime.get_prompt(prompt_name, arguments).await
+    }
+
+    /// Returns whether a connected server advertises the given capability key
+    /// (for example "resources" or "prompts") in its negotiated capabilities.
+    pub async fn supports_capability(&self, server_id: &str, key: &str) -> bool {
+        let Ok(runtime) = self.server(server_id, "capabilities").await else {
+            return false;
+        };
+        runtime.upstream_supports(key).await
     }
 
     /// Lists runtime skills allowed by the current skill policy.
@@ -835,6 +1192,10 @@ impl ServerRuntime {
             observed_state: state.lifecycle.state(),
             tool_count: tools.as_ref().map_or(0, |snapshot| snapshot.tool_count),
             tools_stale: tools.as_ref().is_some_and(|snapshot| snapshot.stale),
+            use_count: None,
+            error_count: None,
+            last_used_at_unix_ms: None,
+            projects: Vec::new(),
         }
     }
 
@@ -1427,6 +1788,17 @@ impl ServerRuntime {
         }
     }
 
+    /// Returns cached tool names and descriptions without cloning schemas.
+    async fn cached_tool_names(&self) -> Option<Vec<(String, Option<String>)>> {
+        self.tools.lock().await.as_ref().map(|snapshot| {
+            snapshot
+                .tools
+                .iter()
+                .map(|tool| (tool.name.clone(), tool.description.clone()))
+                .collect()
+        })
+    }
+
     async fn refresh(self: &Arc<Self>) -> Result<ToolSnapshot, RuntimeError> {
         let (peer, session_epoch) = {
             let state = self.state.lock().await;
@@ -1476,6 +1848,178 @@ impl ServerRuntime {
                     "tool refresh timed out",
                 ))
             }
+        }
+    }
+
+    /// Returns a connected peer plus the session epoch, or a lifecycle error.
+    async fn connected_peer(
+        &self,
+        operation: &str,
+    ) -> Result<(Peer<RoleClient>, u64), RuntimeError> {
+        let state = self.state.lock().await;
+        if state.lifecycle.state() != LifecycleState::Connected {
+            return Err(self.error(
+                RuntimeErrorCode::ServerNotConnected,
+                operation,
+                "the server is not connected",
+            ));
+        }
+        let peer = state
+            .session
+            .as_ref()
+            .map(|session| session.service.peer().clone())
+            .ok_or_else(|| {
+                self.error(
+                    RuntimeErrorCode::ServerNotConnected,
+                    operation,
+                    "the server session is unavailable",
+                )
+            })?;
+        Ok((peer, state.epoch))
+    }
+
+    /// Returns true when the negotiated upstream capabilities advertise the key.
+    async fn upstream_supports(&self, capability: &str) -> bool {
+        self.state
+            .lock()
+            .await
+            .upstream
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get(capability))
+            .is_some()
+    }
+
+    async fn list_resources(self: &Arc<Self>) -> Result<Value, RuntimeError> {
+        let (peer, session_epoch) = self.connected_peer("list_resources").await?;
+        if !self.upstream_supports("resources").await {
+            return Err(self.error(
+                RuntimeErrorCode::ResourcesNotSupported,
+                "list_resources",
+                "the server does not advertise resource capabilities",
+            ));
+        }
+        let result = timeout(self.settings.request_timeout, peer.list_all_resources()).await;
+        match result {
+            Ok(Ok(resources)) => serde_json::to_value(resources).map_err(|_| {
+                self.error(
+                    RuntimeErrorCode::ProtocolError,
+                    "list_resources",
+                    "resource list could not be serialized",
+                )
+            }),
+            Ok(Err(error)) => {
+                if matches!(error, ServiceError::TransportClosed) {
+                    self.mark_transport_closed(session_epoch).await;
+                }
+                Err(self.request_error("list_resources", error))
+            }
+            Err(_) => Err(self.error(
+                RuntimeErrorCode::ToolCallTimeout,
+                "list_resources",
+                "resource listing timed out",
+            )),
+        }
+    }
+
+    async fn read_resource(self: &Arc<Self>, uri: &str) -> Result<Value, RuntimeError> {
+        let (peer, session_epoch) = self.connected_peer("read_resource").await?;
+        if !self.upstream_supports("resources").await {
+            return Err(self.error(
+                RuntimeErrorCode::ResourcesNotSupported,
+                "read_resource",
+                "the server does not advertise resource capabilities",
+            ));
+        }
+        let params = ReadResourceRequestParams::new(uri);
+        let result = timeout(self.settings.request_timeout, peer.read_resource(params)).await;
+        match result {
+            Ok(Ok(resource)) => serde_json::to_value(resource).map_err(|_| {
+                self.error(
+                    RuntimeErrorCode::ProtocolError,
+                    "read_resource",
+                    "resource content could not be serialized",
+                )
+            }),
+            Ok(Err(error)) => {
+                if matches!(error, ServiceError::TransportClosed) {
+                    self.mark_transport_closed(session_epoch).await;
+                }
+                Err(self.request_error("read_resource", error))
+            }
+            Err(_) => Err(self.error(
+                RuntimeErrorCode::ToolCallTimeout,
+                "read_resource",
+                "resource read timed out",
+            )),
+        }
+    }
+
+    async fn list_prompts(self: &Arc<Self>) -> Result<Value, RuntimeError> {
+        let (peer, session_epoch) = self.connected_peer("list_prompts").await?;
+        if !self.upstream_supports("prompts").await {
+            return Err(self.error(
+                RuntimeErrorCode::PromptsNotSupported,
+                "list_prompts",
+                "the server does not advertise prompt capabilities",
+            ));
+        }
+        let result = timeout(self.settings.request_timeout, peer.list_all_prompts()).await;
+        match result {
+            Ok(Ok(prompts)) => serde_json::to_value(prompts).map_err(|_| {
+                self.error(
+                    RuntimeErrorCode::ProtocolError,
+                    "list_prompts",
+                    "prompt list could not be serialized",
+                )
+            }),
+            Ok(Err(error)) => {
+                if matches!(error, ServiceError::TransportClosed) {
+                    self.mark_transport_closed(session_epoch).await;
+                }
+                Err(self.request_error("list_prompts", error))
+            }
+            Err(_) => Err(self.error(
+                RuntimeErrorCode::ToolCallTimeout,
+                "list_prompts",
+                "prompt listing timed out",
+            )),
+        }
+    }
+
+    async fn get_prompt(
+        self: &Arc<Self>,
+        name: &str,
+        arguments: Map<String, Value>,
+    ) -> Result<Value, RuntimeError> {
+        let (peer, session_epoch) = self.connected_peer("call_prompt").await?;
+        if !self.upstream_supports("prompts").await {
+            return Err(self.error(
+                RuntimeErrorCode::PromptsNotSupported,
+                "call_prompt",
+                "the server does not advertise prompt capabilities",
+            ));
+        }
+        let params = GetPromptRequestParams::new(name).with_arguments(arguments);
+        let result = timeout(self.settings.request_timeout, peer.get_prompt(params)).await;
+        match result {
+            Ok(Ok(prompt)) => serde_json::to_value(prompt).map_err(|_| {
+                self.error(
+                    RuntimeErrorCode::ProtocolError,
+                    "call_prompt",
+                    "prompt result could not be serialized",
+                )
+            }),
+            Ok(Err(error)) => {
+                if matches!(error, ServiceError::TransportClosed) {
+                    self.mark_transport_closed(session_epoch).await;
+                }
+                Err(self.request_error("call_prompt", error))
+            }
+            Err(_) => Err(self.error(
+                RuntimeErrorCode::ToolCallTimeout,
+                "call_prompt",
+                "prompt call timed out",
+            )),
         }
     }
 
@@ -1978,6 +2522,44 @@ fn request_timeout(
     Ok(Duration::from_millis(milliseconds))
 }
 
+const MAX_TOOL_SUGGESTIONS: usize = 8;
+
+/// Lowercases, trims, and collapses whitespace; returns an empty string when
+/// the query contains nothing indexable.
+fn normalize_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Ranks a tool name against a normalized query: exact = 0, prefix = 1,
+/// substring = 2, all query words contained = 3, otherwise no match.
+fn score_tool_name(normalized_query: &str, tool_name: &str) -> Option<u32> {
+    if normalized_query.is_empty() {
+        return None;
+    }
+    let normalized_name = normalize_query(tool_name);
+    if normalized_name == normalized_query {
+        return Some(0);
+    }
+    if normalized_name.starts_with(normalized_query) {
+        return Some(1);
+    }
+    if normalized_name.contains(normalized_query) {
+        return Some(2);
+    }
+    let words = normalized_query
+        .split(' ')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() > 1 && words.iter().all(|word| normalized_name.contains(word)) {
+        return Some(3);
+    }
+    None
+}
+
 fn spawn_monitor(
     runtime: Weak<ServerRuntime>,
     peer: Peer<RoleClient>,
@@ -2170,15 +2752,16 @@ mod tests {
     use std::{fs, sync::Arc};
 
     use mcp_host_core::{
-        EnvironmentAccessError, EnvironmentProvider, ManifestLoader, McpServerRegistry, Policy,
-        ReconnectConfig, RegistryBuilder, SkillCatalog,
+        CallPolicy, EnvironmentAccessError, EnvironmentProvider, ManifestLoader, McpServerRegistry,
+        Policy, ReconnectConfig, RegistryBuilder, SkillCatalog,
     };
     use rmcp::model::Tool;
     use serde_json::{Map, json};
     use tempfile::tempdir;
 
     use super::{
-        RuntimeManager, RuntimeSettings, reconnect_delay, sanitize_pending, tool_definition,
+        RuntimeManager, RuntimeSettings, normalize_query, reconnect_delay, sanitize_pending,
+        score_tool_name, tool_definition,
     };
 
     struct EmptyEnvironment;
@@ -2193,11 +2776,11 @@ mod tests {
     async fn unknown_and_disabled_servers_are_rejected() {
         let manager = manager("disabled", false);
         let unknown = manager
-            .connect_server("missing")
+            .connect_server("missing", None)
             .await
             .expect_err("unknown must fail");
         let disabled = manager
-            .connect_server("disabled")
+            .connect_server("disabled", None)
             .await
             .expect_err("disabled must fail");
         assert_eq!(unknown.code.as_str(), "SERVER_NOT_FOUND");
@@ -2208,10 +2791,46 @@ mod tests {
     async fn invalid_tool_arguments_are_rejected_before_connection() {
         let manager = manager("enabled", true);
         let error = manager
-            .call_tool("enabled", "tool", json!("not-an-object"), None)
+            .call_tool(
+                "enabled",
+                "tool",
+                json!("not-an-object"),
+                None,
+                CallPolicy::default(),
+            )
             .await
             .expect_err("invalid arguments must fail");
         assert_eq!(error.code.as_str(), "INVALID_ARGUMENTS");
+    }
+
+    #[test]
+    fn tool_name_scoring_ranks_exact_then_prefix_then_substring_then_words() {
+        let cases = [
+            ("echo", "echo", Some(0)),
+            ("echo", "echos", Some(1)),
+            ("echo", "multiecho", Some(2)),
+            ("get user", "get_user_by_id", Some(3)),
+            ("get user", "get_user", Some(3)),
+            ("zebra", "echo", None),
+            ("", "echo", None),
+            ("ECHO", "echo", Some(0)),
+            ("read file", "write_file", None),
+        ];
+        for (query, name, expected) in cases {
+            let normalized = normalize_query(query);
+            assert_eq!(
+                score_tool_name(&normalized, name),
+                expected,
+                "query {query:?} vs name {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_query_lowercases_and_collapses_whitespace() {
+        assert_eq!(normalize_query("  Get  User "), "get user");
+        assert_eq!(normalize_query(""), "");
+        assert_eq!(normalize_query("   "), "");
     }
 
     #[tokio::test]
@@ -2272,7 +2891,7 @@ mod tests {
             ),
         );
         let error = manager
-            .connect_server("alpha")
+            .connect_server("alpha", None)
             .await
             .expect_err("policy should deny connect before process startup");
         assert_eq!(error.code.as_str(), "POLICY_DENIED");
