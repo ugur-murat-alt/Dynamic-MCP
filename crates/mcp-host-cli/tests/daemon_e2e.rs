@@ -119,14 +119,12 @@ async fn real_rmcp_client_reaches_upstream_through_bridge_and_daemon() {
     assert_eq!(
         tools,
         [
-            "call_prompt",
             "call_tool",
             "call_tools",
             "connect_server",
             "disconnect_server",
             "find_tool",
             "inspect_server",
-            "list_prompts",
             "list_resources",
             "list_servers",
             "list_tools",
@@ -487,6 +485,104 @@ async fn repeated_connects_register_the_proxy_exactly_once() {
     assert_eq!(registered["name"], "mcp-host-fixture");
     let extra = tokio::time::timeout(Duration::from_millis(400), events.registered()).await;
     assert!(extra.is_err(), "a repeated connect must not register again");
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_surface_connect_and_disconnect_keep_the_proxy_in_sync() {
+    let (mut events, url) = mock_opencode_server().await;
+    let mut daemon = TestDaemon::start_with_opencode(Some(&url)).await;
+    let client = host_client(&daemon).await;
+
+    let connected =
+        call_host_tool(&client, "connect_server", json!({"server_id": "fixture"})).await;
+    assert_eq!(
+        host_envelope(&connected, "connect_server")["data"]["state"],
+        "connected"
+    );
+    let socket = daemon.runtime_dir.join("mcp-fixture.sock");
+    tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the MCP surface connect must open the proxy socket");
+    let registered = tokio::time::timeout(PROCESS_TIMEOUT, events.registered())
+        .await
+        .expect("opencode serve should receive the registration")
+        .expect("registration event");
+    assert_eq!(registered["name"], "mcp-host-fixture");
+
+    let disconnected = call_host_tool(
+        &client,
+        "disconnect_server",
+        json!({"server_id": "fixture"}),
+    )
+    .await;
+    assert_eq!(
+        host_envelope(&disconnected, "disconnect_server")["data"]["state"],
+        "disconnected"
+    );
+    tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if !socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the MCP surface disconnect must remove the proxy socket");
+    let name = tokio::time::timeout(PROCESS_TIMEOUT, events.disconnected())
+        .await
+        .expect("opencode serve should receive the disconnect")
+        .expect("disconnect event");
+    assert_eq!(name, "mcp-host-fixture");
+    daemon.stop();
+    daemon.assert_clean_shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_connect_call_opens_the_proxy_endpoint_too() {
+    let (mut events, url) = mock_opencode_server().await;
+    let mut daemon = TestDaemon::start_with_opencode(Some(&url)).await;
+    let client = host_client(&daemon).await;
+
+    let echoed = call_host_tool(
+        &client,
+        "call_tool",
+        json!({
+            "server_id": "fixture",
+            "tool_name": "echo",
+            "arguments": {"message": "auto"}
+        }),
+    )
+    .await;
+    assert_eq!(
+        host_envelope(&echoed, "call_tool")["data"]["result"]["structuredContent"]["message"],
+        "auto"
+    );
+    let socket = daemon.runtime_dir.join("mcp-fixture.sock");
+    tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            if socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("an auto-connecting call must open the proxy socket");
+    let registered = tokio::time::timeout(PROCESS_TIMEOUT, events.registered())
+        .await
+        .expect("opencode serve should receive the registration")
+        .expect("registration event");
+    assert_eq!(registered["name"], "mcp-host-fixture");
     daemon.stop();
     daemon.assert_clean_shutdown();
 }

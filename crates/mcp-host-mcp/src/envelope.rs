@@ -69,14 +69,21 @@ impl From<&RuntimeError> for HostToolErrorEnvelope {
 }
 
 pub fn output_schema() -> Arc<Map<String, Value>> {
-    let value = serde_json::to_value(schemars::schema_for!(HostToolEnvelope<Map<String, Value>>))
-        .expect("host tool envelope schema should serialize");
-    Arc::new(
-        value
-            .as_object()
-            .expect("host tool envelope schema should be an object")
-            .clone(),
-    )
+    use std::sync::OnceLock;
+    static SCHEMA: OnceLock<Arc<Map<String, Value>>> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            let value =
+                serde_json::to_value(schemars::schema_for!(HostToolEnvelope<Map<String, Value>>))
+                    .expect("host tool envelope schema should serialize");
+            Arc::new(
+                value
+                    .as_object()
+                    .expect("host tool envelope schema should be an object")
+                    .clone(),
+            )
+        })
+        .clone()
 }
 
 #[cfg(test)]

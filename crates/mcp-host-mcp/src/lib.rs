@@ -11,4 +11,4 @@ mod skill;
 
 pub use host::{DownstreamSessionGuard, HostMcpServer, HostRuntimeState};
 pub use proxy::ProxyMcpServer;
-pub use runtime::{RuntimeManager, RuntimeSettings};
+pub use runtime::{ConnectionHooks, RuntimeManager, RuntimeSettings};

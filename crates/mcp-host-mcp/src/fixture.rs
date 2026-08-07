@@ -6,11 +6,9 @@ use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResponse, GetPromptResult,
-        Implementation, InitializeRequestParams, ListPromptsResult, ListResourcesResult,
-        PaginatedRequestParams, Prompt, PromptArgument, PromptMessage, ReadResourceRequestParams,
-        ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, Role,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, InitializeRequestParams, ListResourcesResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
     },
     service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
@@ -171,7 +169,6 @@ impl ServerHandler for FixtureServer {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
-                .enable_prompts()
                 .build(),
         )
         .with_server_info(Implementation::new(
@@ -213,48 +210,6 @@ impl ServerHandler for FixtureServer {
                 meta: None,
             }],
         )))
-    }
-
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        Ok(ListPromptsResult {
-            prompts: vec![Prompt::new(
-                "greet",
-                Some("Greet a person by name"),
-                Some(vec![
-                    PromptArgument::new("name")
-                        .with_description("The person to greet")
-                        .with_required(true),
-                ]),
-            )],
-            ..Default::default()
-        })
-    }
-
-    async fn get_prompt(
-        &self,
-        request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResponse, ErrorData> {
-        if request.name != "greet" {
-            return Err(ErrorData::new(
-                rmcp::model::ErrorCode::INVALID_PARAMS,
-                "unknown fixture prompt name",
-                None,
-            ));
-        }
-        let name = request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("world");
-        Ok(GetPromptResponse::Complete(GetPromptResult::new(vec![
-            PromptMessage::new_text(Role::User, format!("Hello, {name}!")),
-        ])))
     }
 }
 

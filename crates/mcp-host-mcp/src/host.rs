@@ -27,7 +27,7 @@ use crate::{
 };
 
 const SERVER_DESCRIPTION: &str = "A long-running MCP runtime and process manager that presents one stable MCP server to AI clients while managing manifest-defined MCP servers as downstream clients.";
-const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers; use_count and projects show usage memory.\n2. Call find_tool to search tool names across servers, or inspect_server to review a server's public configuration and state.\n3. connect_server is only needed for non-call operations: call_tool auto-connects registered servers by default.\n4. Call list_tools (detail \"summary\" for compact entries) to discover exact tool names and schemas.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations; both auto-refresh stale caches and suggest close names on TOOL_NOT_FOUND.\n6. For servers that advertise them, use list_resources/read_resource and list_prompts/call_prompt.\n7. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.\n8. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.\n9. For call_tool and successful call_tools items, also inspect the downstream isError field.";
+const INSTRUCTIONS: &str = "1. Call list_servers to discover available downstream MCP servers; use_count and projects show usage memory.\n2. Call find_tool to search tool names across servers, or inspect_server to review a server's public configuration and state.\n3. connect_server is only needed for non-call operations: call_tool auto-connects registered servers by default.\n4. Call list_tools (detail \"summary\" for compact entries) to discover exact tool names and schemas.\n5. Call call_tool for one invocation or call_tools for up to 32 parallel invocations; both auto-refresh stale caches and suggest close names on TOOL_NOT_FOUND.\n6. For servers that advertise them, use list_resources/read_resource.\n7. Use refresh_server when tools may have changed, then disconnect_server when the server is no longer needed.\n8. Read machine results from structuredContent.data in the dynamic-mcp/v1 envelope.\n9. For call_tool and successful call_tools items, also inspect the downstream isError field.";
 
 /// Shared process state owned by the daemon hosting inbound MCP sessions.
 pub struct HostRuntimeState {
@@ -181,14 +181,6 @@ struct FindToolParams {
 struct ReadResourceParams {
     server_id: String,
     uri: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
-struct CallPromptParams {
-    server_id: String,
-    prompt_name: String,
-    #[serde(default)]
-    arguments: Map<String, Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -520,38 +512,6 @@ impl HostMcpServer {
             .map_err(runtime_error)?;
         structured_result("read_resource", resource, "Read downstream MCP resource.")
     }
-
-    #[tool(description = "List reusable prompts advertised by a connected downstream MCP server.")]
-    async fn list_prompts(
-        &self,
-        Parameters(ServerIdParams { server_id }): Parameters<ServerIdParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let prompts = self
-            .runtime
-            .list_prompts(&server_id)
-            .await
-            .map_err(runtime_error)?;
-        structured_result("list_prompts", prompts, "Listed downstream MCP prompts.")
-    }
-
-    #[tool(
-        description = "Invoke a prompt on a connected downstream MCP server with object arguments."
-    )]
-    async fn call_prompt(
-        &self,
-        Parameters(CallPromptParams {
-            server_id,
-            prompt_name,
-            arguments,
-        }): Parameters<CallPromptParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let result = self
-            .runtime
-            .call_prompt(&server_id, &prompt_name, arguments)
-            .await
-            .map_err(runtime_error)?;
-        structured_result("call_prompt", result, "Invoked downstream MCP prompt.")
-    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -662,14 +622,12 @@ mod tests {
         assert_eq!(
             server.tool_names(),
             [
-                "call_prompt",
                 "call_tool",
                 "call_tools",
                 "connect_server",
                 "disconnect_server",
                 "find_tool",
                 "inspect_server",
-                "list_prompts",
                 "list_resources",
                 "list_servers",
                 "list_tools",

@@ -251,7 +251,7 @@ async fn max_output_tokens_truncates_oversized_results() {
 }
 
 #[tokio::test]
-async fn fixture_exposes_resources_and_prompts_through_the_runtime() {
+async fn fixture_exposes_resources_through_the_runtime() {
     let fixture = FixtureRuntime::new();
     let manager = fixture.manager();
     manager
@@ -274,29 +274,10 @@ async fn fixture_exposes_resources_and_prompts_through_the_runtime() {
         .await
         .expect("resource should be readable");
     assert_eq!(read["contents"][0]["text"], "fixture information resource");
-
-    let prompts = manager
-        .list_prompts("fixture")
-        .await
-        .expect("prompts should be listed");
-    let prompts = prompts.as_array().expect("prompt list should be an array");
-    assert_eq!(prompts[0]["name"], "greet");
-
-    let mut arguments = serde_json::Map::new();
-    arguments.insert("name".to_owned(), json!("Ada"));
-    let greeting = manager
-        .call_prompt("fixture", "greet", arguments)
-        .await
-        .expect("prompt should be callable");
-    assert!(
-        greeting["messages"][0]["content"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("Hello, Ada!"))
-    );
 }
 
 #[tokio::test]
-async fn resources_and_prompts_require_a_connected_server() {
+async fn resources_require_a_connected_server() {
     let fixture = FixtureRuntime::new();
     let manager = fixture.manager();
 
@@ -304,12 +285,6 @@ async fn resources_and_prompts_require_a_connected_server() {
         .list_resources("fixture")
         .await
         .expect_err("disconnected server must fail resource listing");
-    assert_eq!(error.code, RuntimeErrorCode::ServerNotConnected);
-
-    let error = manager
-        .list_prompts("fixture")
-        .await
-        .expect_err("disconnected server must fail prompt listing");
     assert_eq!(error.code, RuntimeErrorCode::ServerNotConnected);
 }
 

@@ -32,14 +32,14 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{
     ClientHandler, Peer, ServiceError, ServiceExt,
     model::{
-        CallToolRequest, CallToolRequestParams, ClientInfo, ClientRequest, GetPromptRequestParams,
-        ProtocolVersion, ReadResourceRequestParams, ServerInfo, ServerResult, Tool,
+        CallToolRequest, CallToolRequestParams, ClientInfo, ClientRequest, ProtocolVersion,
+        ReadResourceRequestParams, ServerInfo, ServerResult, Tool,
     },
     service::{PeerRequestOptions, RoleClient, RunningService},
     transport::{StreamableHttpClientTransport, TokioChildProcess},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::{
     io::AsyncReadExt,
     sync::{Mutex, Notify, RwLock},
@@ -75,6 +75,7 @@ impl UsageTracker {
     fn load(root: Option<&std::path::Path>) -> Self {
         let journal = root.map(|directory| directory.join("usage.jsonl"));
         let mut inner: BTreeMap<String, ServerUsage> = BTreeMap::new();
+        let mut compacted = false;
         if let Some(path) = &journal
             && let Ok(lines) = std::fs::read_to_string(path)
         {
@@ -84,10 +85,8 @@ impl UsageTracker {
                 };
                 let usage = inner.entry(event.server_id.clone()).or_default();
                 if event.kind == UsageKind::Call {
-                    usage.call_count = usage.call_count.saturating_add(1);
-                    if !event.success {
-                        usage.error_count = usage.error_count.saturating_add(1);
-                    }
+                    usage.call_count = usage.call_count.saturating_add(event.count.max(1));
+                    usage.error_count = usage.error_count.saturating_add(event.errors);
                     if usage.last_used_at_unix_ms.is_none_or(|ts| event.ts > ts) {
                         usage.last_used_at_unix_ms = Some(event.ts);
                     }
@@ -99,11 +98,56 @@ impl UsageTracker {
                     usage.projects.pop_first();
                 }
             }
+            compacted = true;
+        }
+        if compacted && let Some(journal) = &journal {
+            // Compact the journal to a single snapshot so startup cost and
+            // file size stay bounded for long-lived daemons.
+            Self::compact_journal(&inner, journal);
         }
         Self {
             inner: RwLock::new(inner),
             journal,
         }
+    }
+
+    fn compact_journal(inner: &BTreeMap<String, ServerUsage>, journal: &std::path::Path) {
+        let mut lines = String::new();
+        let ts = |usage: &ServerUsage| usage.last_used_at_unix_ms.unwrap_or(0);
+        for (server_id, usage) in inner.iter() {
+            if usage.call_count == 0 && usage.projects.is_empty() {
+                continue;
+            }
+            for project in &usage.projects {
+                lines.push_str(&format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ts": ts(usage),
+                        "kind": "connect",
+                        "server_id": server_id,
+                        "success": true,
+                        "project": project,
+                    })
+                ));
+            }
+            if usage.call_count > 0 {
+                lines.push_str(&format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "ts": ts(usage),
+                        "kind": "call",
+                        "server_id": server_id,
+                        "success": usage.error_count == 0,
+                        "count": usage.call_count,
+                        "errors": usage.error_count,
+                    })
+                ));
+            }
+        }
+        if let Some(parent) = journal.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(journal, lines);
     }
 
     async fn record_call(&self, server_id: &str, success: bool) {
@@ -112,6 +156,8 @@ impl UsageTracker {
             kind: UsageKind::Call,
             server_id: server_id.to_owned(),
             success,
+            count: 1,
+            errors: u64::from(!success),
             project: None,
         })
         .await;
@@ -123,6 +169,8 @@ impl UsageTracker {
             kind: UsageKind::Connect,
             server_id: server_id.to_owned(),
             success: true,
+            count: 1,
+            errors: 0,
             project: Some(project.to_owned()),
         })
         .await;
@@ -153,7 +201,7 @@ impl UsageTracker {
             return;
         };
         let journal = journal.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let handle = tokio::task::spawn_blocking(move || {
             if let Some(parent) = journal.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -165,8 +213,8 @@ impl UsageTracker {
             {
                 let _ = writeln!(file, "{line}");
             }
-        })
-        .await;
+        });
+        drop(handle);
     }
 
     async fn snapshot(&self) -> BTreeMap<String, ServerUsage> {
@@ -189,8 +237,18 @@ struct UsageEvent {
     kind: UsageKind,
     server_id: String,
     success: bool,
+    /// Number of calls this event represents (compacted journals collapse many).
+    #[serde(default = "default_event_count")]
+    count: u64,
+    /// Number of failed calls this event represents.
+    #[serde(default)]
+    errors: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+}
+
+const fn default_event_count() -> u64 {
+    1
 }
 
 /// Runtime limits for downstream MCP servers.
@@ -249,6 +307,46 @@ pub struct RuntimeManager {
     shutdown: CancellationToken,
     package_installer: Option<PackageInstaller>,
     usage: UsageTracker,
+    hooks: RwLock<ConnectionHooks>,
+}
+
+/// Lifecycle callbacks invoked by every connect/disconnect path so the daemon
+/// can keep per-server artifacts (proxy endpoints, opencode registrations) in
+/// sync regardless of which surface triggered the transition.
+#[derive(Clone)]
+pub struct ConnectionHooks {
+    on_connected: Arc<dyn Fn(&str) + Send + Sync>,
+    on_disconnected: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl Default for ConnectionHooks {
+    fn default() -> Self {
+        Self {
+            on_connected: Arc::new(|_| {}),
+            on_disconnected: Arc::new(|_| {}),
+        }
+    }
+}
+
+impl ConnectionHooks {
+    #[must_use]
+    pub fn new(
+        on_connected: Arc<dyn Fn(&str) + Send + Sync>,
+        on_disconnected: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Self {
+            on_connected,
+            on_disconnected,
+        }
+    }
+
+    fn connected(&self, server_id: &str) {
+        (self.on_connected)(server_id);
+    }
+
+    fn disconnected(&self, server_id: &str) {
+        (self.on_disconnected)(server_id);
+    }
 }
 
 struct RuntimeCatalog {
@@ -320,7 +418,13 @@ impl RuntimeManager {
             shutdown,
             package_installer,
             usage,
+            hooks: RwLock::new(ConnectionHooks::default()),
         })
+    }
+
+    /// Installs lifecycle hooks for proxy/registration side effects.
+    pub async fn set_connection_hooks(&self, hooks: ConnectionHooks) {
+        *self.hooks.write().await = hooks;
     }
 
     /// Returns the current immutable registry snapshot.
@@ -421,13 +525,18 @@ impl RuntimeManager {
         };
 
         for runtime in retired {
-            let _ = runtime.disconnect().await;
+            if runtime.disconnect().await.is_ok() {
+                self.hooks.read().await.disconnected(&runtime.id);
+            }
         }
         for (old, replacement) in replaced {
             let reconnect = old.desired().await == DesiredConnection::Connected;
-            let _ = old.disconnect().await;
-            if reconnect && replacement.registered.enabled() {
-                let _ = replacement.connect().await;
+            if old.disconnect().await.is_ok() {
+                self.hooks.read().await.disconnected(&old.id);
+            }
+            if reconnect && replacement.registered.enabled() && replacement.connect().await.is_ok()
+            {
+                self.hooks.read().await.connected(&replacement.id);
             }
         }
 
@@ -498,10 +607,11 @@ impl RuntimeManager {
         self.authorize(PolicyAction::Connect, &runtime.id, None, "connect_server")
             .await?;
         let result = runtime.connect().await;
-        if result.is_ok()
-            && let Some(project) = project
-        {
-            self.usage.record_project(server_id, project).await;
+        if result.is_ok() {
+            if let Some(project) = project {
+                self.usage.record_project(server_id, project).await;
+            }
+            self.hooks.read().await.connected(&runtime.id);
         }
         trace_operation("connect_server", server_id, started, &result);
         result
@@ -522,6 +632,9 @@ impl RuntimeManager {
         )
         .await?;
         let result = runtime.disconnect().await;
+        if result.is_ok() {
+            self.hooks.read().await.disconnected(&runtime.id);
+        }
         trace_operation("disconnect_server", server_id, started, &result);
         result
     }
@@ -596,6 +709,7 @@ impl RuntimeManager {
             self.authorize(PolicyAction::Connect, &runtime.id, None, "auto_connect")
                 .await?;
             runtime.connect().await?;
+            self.hooks.read().await.connected(&runtime.id);
         }
         let mut result = runtime
             .call_tool(tool_name, arguments.clone(), timeout_ms)
@@ -780,32 +894,6 @@ impl RuntimeManager {
         self.authorize(PolicyAction::List, &runtime.id, None, "read_resource")
             .await?;
         runtime.read_resource(uri).await
-    }
-
-    /// Lists prompts advertised by a connected server.
-    pub async fn list_prompts(&self, server_id: &str) -> Result<Value, RuntimeError> {
-        let runtime = self.server(server_id, "list_prompts").await?;
-        self.authorize(PolicyAction::List, &runtime.id, None, "list_prompts")
-            .await?;
-        runtime.list_prompts().await
-    }
-
-    /// Invokes a prompt on a connected server with object arguments.
-    pub async fn call_prompt(
-        &self,
-        server_id: &str,
-        prompt_name: &str,
-        arguments: Map<String, Value>,
-    ) -> Result<Value, RuntimeError> {
-        let runtime = self.server(server_id, "call_prompt").await?;
-        self.authorize(
-            PolicyAction::Call,
-            &runtime.id,
-            Some(prompt_name),
-            "call_prompt",
-        )
-        .await?;
-        runtime.get_prompt(prompt_name, arguments).await
     }
 
     /// Returns whether a connected server advertises the given capability key
@@ -1950,75 +2038,6 @@ impl ServerRuntime {
                 RuntimeErrorCode::ToolCallTimeout,
                 "read_resource",
                 "resource read timed out",
-            )),
-        }
-    }
-
-    async fn list_prompts(self: &Arc<Self>) -> Result<Value, RuntimeError> {
-        let (peer, session_epoch) = self.connected_peer("list_prompts").await?;
-        if !self.upstream_supports("prompts").await {
-            return Err(self.error(
-                RuntimeErrorCode::PromptsNotSupported,
-                "list_prompts",
-                "the server does not advertise prompt capabilities",
-            ));
-        }
-        let result = timeout(self.settings.request_timeout, peer.list_all_prompts()).await;
-        match result {
-            Ok(Ok(prompts)) => serde_json::to_value(prompts).map_err(|_| {
-                self.error(
-                    RuntimeErrorCode::ProtocolError,
-                    "list_prompts",
-                    "prompt list could not be serialized",
-                )
-            }),
-            Ok(Err(error)) => {
-                if matches!(error, ServiceError::TransportClosed) {
-                    self.mark_transport_closed(session_epoch).await;
-                }
-                Err(self.request_error("list_prompts", error))
-            }
-            Err(_) => Err(self.error(
-                RuntimeErrorCode::ToolCallTimeout,
-                "list_prompts",
-                "prompt listing timed out",
-            )),
-        }
-    }
-
-    async fn get_prompt(
-        self: &Arc<Self>,
-        name: &str,
-        arguments: Map<String, Value>,
-    ) -> Result<Value, RuntimeError> {
-        let (peer, session_epoch) = self.connected_peer("call_prompt").await?;
-        if !self.upstream_supports("prompts").await {
-            return Err(self.error(
-                RuntimeErrorCode::PromptsNotSupported,
-                "call_prompt",
-                "the server does not advertise prompt capabilities",
-            ));
-        }
-        let params = GetPromptRequestParams::new(name).with_arguments(arguments);
-        let result = timeout(self.settings.request_timeout, peer.get_prompt(params)).await;
-        match result {
-            Ok(Ok(prompt)) => serde_json::to_value(prompt).map_err(|_| {
-                self.error(
-                    RuntimeErrorCode::ProtocolError,
-                    "call_prompt",
-                    "prompt result could not be serialized",
-                )
-            }),
-            Ok(Err(error)) => {
-                if matches!(error, ServiceError::TransportClosed) {
-                    self.mark_transport_closed(session_epoch).await;
-                }
-                Err(self.request_error("call_prompt", error))
-            }
-            Err(_) => Err(self.error(
-                RuntimeErrorCode::ToolCallTimeout,
-                "call_prompt",
-                "prompt call timed out",
             )),
         }
     }

@@ -16,7 +16,8 @@ use mcp_host_core::{
     ServerId, SkillCatalog,
 };
 use mcp_host_mcp::{
-    HostMcpServer, HostRuntimeState, ProxyMcpServer, RuntimeManager, RuntimeSettings,
+    ConnectionHooks, HostMcpServer, HostRuntimeState, ProxyMcpServer, RuntimeManager,
+    RuntimeSettings,
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use rmcp::ServiceExt as _;
@@ -188,16 +189,21 @@ fn filtered_endpoint_path(runtime_dir: &std::path::Path, server_id: &str) -> Str
 
 /// Binds the per-server proxy endpoint when it is not already live.
 /// Returns true only when the endpoint was newly created.
-async fn ensure_filtered_endpoint(context: &DaemonContext, server_id: &str) -> bool {
-    if context
-        .filtered
+async fn ensure_filtered_endpoint(
+    filtered: &std::sync::Mutex<std::collections::BTreeMap<String, FilteredEndpoint>>,
+    runtime_dir: &std::path::Path,
+    runtime: Arc<RuntimeManager>,
+    state: Arc<HostRuntimeState>,
+    server_id: &str,
+) -> bool {
+    if filtered
         .lock()
         .expect("filtered endpoint lock")
         .contains_key(server_id)
     {
         return false;
     }
-    let path = filtered_endpoint_path(&context.linker.runtime_dir, server_id);
+    let path = filtered_endpoint_path(runtime_dir, server_id);
     let listener = match crate::ipc::bind_socket_at(std::path::Path::new(&path)) {
         Ok(listener) => listener,
         Err(error) => {
@@ -213,26 +219,24 @@ async fn ensure_filtered_endpoint(context: &DaemonContext, server_id: &str) -> b
     let cancel = CancellationToken::new();
     let task = tokio::spawn(proxy_accept_loop(
         listener,
-        Arc::clone(&context.runtime),
-        Arc::clone(&context.state),
+        Arc::clone(&runtime),
+        Arc::clone(&state),
         cancel.clone(),
         server_id.to_owned(),
     ));
-    context
-        .filtered
-        .lock()
-        .expect("filtered endpoint lock")
-        .insert(
-            server_id.to_owned(),
-            FilteredEndpoint { path, cancel, task },
-        );
+    filtered.lock().expect("filtered endpoint lock").insert(
+        server_id.to_owned(),
+        FilteredEndpoint { path, cancel, task },
+    );
     tracing::info!(operation = "proxy_ready", server_id);
     true
 }
 
-async fn drop_filtered_endpoint(context: &DaemonContext, server_id: &str) {
-    let Some(endpoint) = context
-        .filtered
+async fn drop_filtered_endpoint(
+    filtered: &std::sync::Mutex<std::collections::BTreeMap<String, FilteredEndpoint>>,
+    server_id: &str,
+) {
+    let Some(endpoint) = filtered
         .lock()
         .expect("filtered endpoint lock")
         .remove(server_id)
@@ -368,6 +372,7 @@ async fn run_daemon_inner(
 ) -> Result<(), RuntimeError> {
     let cancellation = external_shutdown.unwrap_or_default();
     let auth_root = oauth_data_dir();
+    let usage_root = data_local_dir();
     prepare_runtime_dir(&options.runtime_dir)?;
 
     let lock_path = options.runtime_dir.join("daemon.lock");
@@ -409,7 +414,7 @@ async fn run_daemon_inner(
         RuntimeSettings {
             package_root: Some(options.runtime_dir.join("packages")),
             auth_root,
-            usage_root: Some(options.runtime_dir.clone()),
+            usage_root,
             ..RuntimeSettings::default()
         },
         policy,
@@ -465,15 +470,56 @@ async fn run_daemon_inner(
             return Err(error);
         }
     };
+    let filtered = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let linker = OpenCodeLinker::new(
+        options.opencode_serve_url.clone(),
+        options.runtime_dir.clone(),
+    );
     let context = Arc::new(DaemonContext {
         runtime: Arc::clone(&runtime),
         state: Arc::clone(&state),
-        filtered: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
-        linker: OpenCodeLinker::new(
-            options.opencode_serve_url.clone(),
-            options.runtime_dir.clone(),
-        ),
+        filtered: Arc::clone(&filtered),
+        linker: linker.clone(),
     });
+    runtime
+        .set_connection_hooks(ConnectionHooks::new(
+            {
+                let filtered = Arc::clone(&filtered);
+                let linker = linker.clone();
+                let runtime_dir = options.runtime_dir.clone();
+                let runtime = Arc::clone(&runtime);
+                let state = Arc::clone(&state);
+                Arc::new(move |server_id: &str| {
+                    let id = server_id.to_owned();
+                    let filtered = Arc::clone(&filtered);
+                    let linker = linker.clone();
+                    let runtime_dir = runtime_dir.clone();
+                    let runtime = Arc::clone(&runtime);
+                    let state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        if ensure_filtered_endpoint(&filtered, &runtime_dir, runtime, state, &id)
+                            .await
+                        {
+                            linker.register(&id).await;
+                        }
+                    });
+                })
+            },
+            {
+                let filtered = Arc::clone(&filtered);
+                let linker = linker.clone();
+                Arc::new(move |server_id: &str| {
+                    let id = server_id.to_owned();
+                    let filtered = Arc::clone(&filtered);
+                    let linker = linker.clone();
+                    tokio::spawn(async move {
+                        drop_filtered_endpoint(&filtered, &id).await;
+                        linker.unregister(&id).await;
+                    });
+                })
+            },
+        ))
+        .await;
     state.set_control_ready(true);
     state.set_mcp_ready(true);
     let control_accept = tokio::spawn(control_accept_loop(
@@ -523,6 +569,11 @@ async fn run_daemon_inner(
 fn oauth_data_dir() -> Option<PathBuf> {
     ProjectDirs::from("org", "mcp-host", "mcp-host")
         .map(|directories| directories.data_local_dir().join("auth"))
+}
+
+fn data_local_dir() -> Option<PathBuf> {
+    ProjectDirs::from("org", "mcp-host", "mcp-host")
+        .map(|directories| directories.data_local_dir().join("usage"))
 }
 
 struct DaemonFiles {
@@ -776,29 +827,18 @@ async fn dispatch_request(
         ControlRequest::InspectServer { server_id } => {
             json_value("inspect_server", runtime.inspect_server(&server_id).await?)
         }
-        ControlRequest::ConnectServer { server_id, project } => {
-            let normalized = normalize_server_id(&server_id);
-            let result = runtime
-                .connect_server(&normalized, project.as_deref())
-                .await;
-            if result.is_ok() && ensure_filtered_endpoint(context, &normalized).await {
-                let linker = context.linker.clone();
-                let id = normalized.clone();
-                tokio::spawn(async move { linker.register(&id).await });
-            }
-            json_value("connect_server", result?)
-        }
-        ControlRequest::DisconnectServer { server_id } => {
-            let normalized = normalize_server_id(&server_id);
-            let result = runtime.disconnect_server(&normalized).await;
-            if result.is_ok() {
-                drop_filtered_endpoint(context, &normalized).await;
-                let linker = context.linker.clone();
-                let id = normalized.clone();
-                tokio::spawn(async move { linker.unregister(&id).await });
-            }
-            json_value("disconnect_server", result?)
-        }
+        ControlRequest::ConnectServer { server_id, project } => json_value(
+            "connect_server",
+            runtime
+                .connect_server(&normalize_server_id(&server_id), project.as_deref())
+                .await?,
+        ),
+        ControlRequest::DisconnectServer { server_id } => json_value(
+            "disconnect_server",
+            runtime
+                .disconnect_server(&normalize_server_id(&server_id))
+                .await?,
+        ),
         ControlRequest::ListTools { server_id, refresh } => {
             json_value("list_tools", runtime.list_tools(&server_id, refresh).await?)
         }

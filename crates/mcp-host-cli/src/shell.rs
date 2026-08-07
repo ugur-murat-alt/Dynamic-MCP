@@ -345,6 +345,7 @@ async fn handle_line(
     if parsed.timeout.is_none() {
         parsed.timeout = Some(timeout.as_millis() as u64);
     }
+    let refreshes = refreshes_cache(&parsed.command);
     match &parsed.command {
         Command::Shell => {
             eprintln!("error: nested shell sessions are not supported");
@@ -359,7 +360,9 @@ async fn handle_line(
             if let Err(error) = result {
                 eprintln!("{error}");
             }
-            refresh_cache(cache, runtime_dir, timeout).await;
+            if refreshes {
+                refresh_cache(cache, runtime_dir, timeout).await;
+            }
             return true;
         }
         _ => {}
@@ -373,8 +376,25 @@ async fn handle_line(
         Ok(_) => {}
         Err(error) => eprintln!("{error}"),
     }
-    refresh_cache(cache, runtime_dir, timeout).await;
+    if refreshes {
+        refresh_cache(cache, runtime_dir, timeout).await;
+    }
     true
+}
+
+/// Refreshes the completion cache only after commands that can change server
+/// or tool state; read-only commands skip the extra control round trips.
+fn refreshes_cache(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Connect { .. }
+            | Command::Disconnect { .. }
+            | Command::Refresh { .. }
+            | Command::Call(_)
+            | Command::Batch(_)
+            | Command::Skill(_)
+            | Command::Daemon(_)
+    )
 }
 
 fn uses_stdin_input(command: &Command) -> bool {

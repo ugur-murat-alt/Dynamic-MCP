@@ -11,9 +11,8 @@ use mcp_host_core::{CallPolicy, ToolDefinition};
 use rmcp::{
     ErrorData, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, GetPromptRequestParams, GetPromptResponse,
-        Implementation, ListPromptsResult, ListResourcesResult, ListToolsResult,
-        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+        CallToolRequestParams, CallToolResponse, Implementation, ListResourcesResult,
+        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
         ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
@@ -29,7 +28,6 @@ pub struct ProxyMcpServer {
     runtime: Arc<RuntimeManager>,
     server_id: String,
     resources: bool,
-    prompts: bool,
 }
 
 impl ProxyMcpServer {
@@ -40,7 +38,6 @@ impl ProxyMcpServer {
             runtime,
             server_id: server_id.into(),
             resources: false,
-            prompts: false,
         }
     }
 
@@ -49,12 +46,10 @@ impl ProxyMcpServer {
     pub async fn from_runtime(runtime: Arc<RuntimeManager>, server_id: impl Into<String>) -> Self {
         let server_id = server_id.into();
         let resources = runtime.supports_capability(&server_id, "resources").await;
-        let prompts = runtime.supports_capability(&server_id, "prompts").await;
         Self {
             runtime,
             server_id,
             resources,
-            prompts,
         }
     }
 
@@ -73,21 +68,13 @@ impl ProxyMcpServer {
 
 impl ServerHandler for ProxyMcpServer {
     fn get_info(&self) -> ServerInfo {
-        let capabilities = match (self.resources, self.prompts) {
-            (true, true) => ServerCapabilities::builder()
+        let capabilities = if self.resources {
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
-                .enable_prompts()
-                .build(),
-            (true, false) => ServerCapabilities::builder()
-                .enable_tools()
-                .enable_resources()
-                .build(),
-            (false, true) => ServerCapabilities::builder()
-                .enable_tools()
-                .enable_prompts()
-                .build(),
-            (false, false) => ServerCapabilities::builder().enable_tools().build(),
+                .build()
+        } else {
+            ServerCapabilities::builder().enable_tools().build()
         };
         ServerInfo::new(capabilities).with_server_info(
             Implementation::new("mcp-host-proxy", env!("CARGO_PKG_VERSION"))
@@ -163,38 +150,5 @@ impl ServerHandler for ProxyMcpServer {
         let result = serde_json::from_value(resource)
             .map_err(|_| ErrorData::internal_error("proxy resource read decode failed", None))?;
         Ok(ReadResourceResponse::Complete(result))
-    }
-
-    async fn list_prompts(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = self
-            .runtime
-            .list_prompts(&self.server_id)
-            .await
-            .map_err(runtime_error)?;
-        serde_json::from_value(Value::Object(Map::from_iter([(
-            "prompts".to_owned(),
-            prompts,
-        )])))
-        .map_err(|_| ErrorData::internal_error("proxy prompt decode failed", None))
-    }
-
-    async fn get_prompt(
-        &self,
-        request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<GetPromptResponse, ErrorData> {
-        let arguments = request.arguments.unwrap_or_default();
-        let result = self
-            .runtime
-            .call_prompt(&self.server_id, &request.name, arguments)
-            .await
-            .map_err(runtime_error)?;
-        let result = serde_json::from_value(result)
-            .map_err(|_| ErrorData::internal_error("proxy prompt call decode failed", None))?;
-        Ok(GetPromptResponse::Complete(result))
     }
 }
