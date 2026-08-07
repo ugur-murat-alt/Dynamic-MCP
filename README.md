@@ -174,8 +174,8 @@ of invoking `mcp-host mcp` directly.
 Once connected through a harness, agents should use the Dynamic MCP tools for
 runtime work: `list_servers`, `inspect_server`, `connect_server`, `list_tools`,
 `find_tool`, `call_tool`/`call_tools`, `refresh_server`, `disconnect_server`,
-`status`, and — for servers that advertise them — `list_resources`,
-`read_resource`, `list_prompts`, and `call_prompt`. The surface is
+`status`, and — for servers that advertise them — `list_resources` and
+`read_resource`. The surface is
 agent-friendly: `call_tool` auto-connects registered servers, recovers from
 stale tool caches with a single refresh-retry pass, attaches close-name
 `suggestions` to `TOOL_NOT_FOUND` errors, and honors an optional
