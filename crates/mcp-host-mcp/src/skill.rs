@@ -53,7 +53,10 @@ impl SkillEngine {
                     step.tool_name(),
                     arguments,
                     step.timeout_ms(),
-                    CallPolicy::default(),
+                    CallPolicy {
+                        max_output_tokens: step.max_output_tokens(),
+                        ..CallPolicy::default()
+                    },
                 )
                 .await
             {

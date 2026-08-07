@@ -240,6 +240,7 @@ pub struct SkillStep {
     tool_name: String,
     arguments: Value,
     timeout_ms: Option<u64>,
+    max_output_tokens: Option<u64>,
 }
 
 impl SkillStep {
@@ -266,6 +267,11 @@ impl SkillStep {
     #[must_use]
     pub const fn timeout_ms(&self) -> Option<u64> {
         self.timeout_ms
+    }
+
+    #[must_use]
+    pub const fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
     }
 }
 
@@ -479,6 +485,8 @@ struct SkillStepFile {
     arguments: Value,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
 }
 
 const fn required_by_default() -> bool {
@@ -544,6 +552,9 @@ fn validate_skill(file: SkillFile) -> Result<RuntimeSkill, SkillValidationError>
             || step
                 .timeout_ms
                 .is_some_and(|timeout| timeout == 0 || timeout > 300_000)
+            || step
+                .max_output_tokens
+                .is_some_and(|tokens| tokens == 0 || tokens > 1_000_000)
         {
             return Err(SkillValidationError::InvalidStepConfiguration(step.id));
         }
@@ -555,6 +566,7 @@ fn validate_skill(file: SkillFile) -> Result<RuntimeSkill, SkillValidationError>
             tool_name: step.tool,
             arguments: step.arguments,
             timeout_ms: step.timeout_ms,
+            max_output_tokens: step.max_output_tokens,
         });
     }
 
@@ -700,6 +712,37 @@ mod tests {
         )
         .expect("invalid fixture");
         assert!(SkillCatalog::load_directory(directory.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_step_output_budgets() {
+        for budget in ["max_output_tokens=0", "max_output_tokens=1000001"] {
+            let directory = tempdir().expect("temporary directory");
+            fs::write(
+                directory.path().join("invalid.skill.toml"),
+                format!(
+                    "id='invalid'\nname='Invalid'\ndescription='Invalid'\n[[steps]]\nid='run'\nserver='fixture'\ntool='echo'\n{budget}\n"
+                ),
+            )
+            .expect("invalid fixture");
+            assert!(
+                SkillCatalog::load_directory(directory.path()).is_err(),
+                "budget {budget} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_step_output_budgets_within_bounds() {
+        let directory = tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join("bounded.skill.toml"),
+            "id='bounded'\nname='Bounded'\ndescription='Bounded skill'\n[[steps]]\nid='run'\nserver='fixture'\ntool='echo'\narguments={message='hi'}\nmax_output_tokens=4096\n",
+        )
+        .expect("bounded fixture");
+        let catalog = SkillCatalog::load_directory(directory.path()).expect("catalog should load");
+        let skill = catalog.get("bounded").expect("skill should exist");
+        assert_eq!(skill.steps()[0].max_output_tokens(), Some(4096));
     }
 
     #[test]

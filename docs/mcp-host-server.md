@@ -46,7 +46,7 @@ list.
 | `connect_server` | `{ "server_id": string }` | Envelope `data` is `ConnectResult`: server ID, lifecycle state, discovered tool count, protocol version, connection time, and tool snapshot. It initializes the downstream server and performs initial tool discovery. |
 | `disconnect_server` | `{ "server_id": string }` | Envelope `data` is `DisconnectResult`: server ID, resulting lifecycle state, and disconnect time. It also cancels an in-progress startup when necessary. |
 | `list_tools` | `{ "server_id": string, "refresh": boolean }`; `refresh` defaults to `false`. | Envelope `data` is `ToolSnapshot`: server ID, fetch time, count, tool definitions, and stale flag. Each definition includes input and optional output schemas plus optional metadata. |
-| `call_tool` | `{ "server_id": string, "tool_name": string, "arguments": object, "timeout_ms"?: integer }`. `arguments` is required and must be a JSON object. `timeout_ms`, when supplied, must be 1 through 300000 milliseconds and must not exceed the host limit. | Preserves downstream top-level `content`, `isError`, and `_meta`; envelope `data.result` contains the complete raw downstream result. |
+| `call_tool` | `{ "server_id": string, "tool_name": string, "arguments": object, "timeout_ms"?: integer, "max_output_tokens"?: integer }`. `arguments` is required and must be a JSON object. `timeout_ms`, when supplied, must be 1 through 300000 milliseconds and must not exceed the host limit. `max_output_tokens`, when supplied, truncates oversized serialized output using a 4-byte-per-token estimate. | Preserves downstream top-level `content`, `isError`, and `_meta`; envelope `data.result` contains the complete raw downstream result. |
 | `call_tools` | `{ "calls": [{ "server_id": string, "tool_name": string, "arguments"?: object, "timeout_ms"?: integer }] }`, with 1 through 32 items. `arguments` defaults to `{}`; each server must already be connected. | Envelope `data.results` contains each `success` result or safe runtime `error`, in input order. |
 | `status` | No arguments. | Envelope `data` is `HostStatus`: daemon and protocol versions, start time and uptime, registry, connected, failed, and active-session counts, listener readiness, and shutdown state. |
 | `refresh_server` | `{ "server_id": string }` | Envelope `data` is a `ToolSnapshot` fetched again from the connected downstream server. |
@@ -85,6 +85,12 @@ content, `_meta`, and `isError`; the complete raw value, including original
 tool-level error remains a valid MCP result with `isError: true`; it is not
 converted into a host protocol error. Envelope `ok: true` means routing and
 transport completed, not that the downstream tool reported success.
+
+The downstream result is intentionally available both as normal MCP content
+and inside `data.result`: clients that only consume content retain standard MCP
+behavior, while agents can use the structured envelope. Use
+`max_output_tokens` for large results to bound both representations; truncated
+results are replaced with a safe preview and `truncated: true`.
 
 Host runtime failures are converted to MCP `ErrorData` safely:
 

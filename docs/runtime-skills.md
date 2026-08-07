@@ -49,7 +49,10 @@ arguments = { text = "Issue: ${steps.create.output.structuredContent.url}" }
 A skill has 1 through 16 ordered steps. Step and input IDs use lowercase ASCII
 letters followed by lowercase letters, digits, or underscores. Step server IDs
 use the normal server-ID rules. Tool names must be non-empty, arguments must be
-a JSON object, and `timeout_ms` must be in `1..=300000` when present. Unknown
+a JSON object, and `timeout_ms` must be in `1..=300000` when present. An
+optional `max_output_tokens` per step caps the serialized step result (4 bytes
+per token); oversized output is replaced by a truncation notice and must be in
+`1..=1000000` when present. Unknown
 fields, duplicate IDs, invalid input defaults, and forward references reject the
 complete reload. Conditions, loops, dependencies, DAGs, expressions, and JSONPath
 are not supported.

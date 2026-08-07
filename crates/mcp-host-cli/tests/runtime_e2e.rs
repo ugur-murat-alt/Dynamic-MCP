@@ -740,6 +740,46 @@ async fn runtime_skill_rechecks_call_policy_for_every_step() {
 }
 
 #[tokio::test]
+async fn skill_step_output_budget_truncates_oversized_results() {
+    let fixture = FixtureRuntime::new();
+    fs::write(
+        fixture.config_dir.join("budget.skill.toml"),
+        r#"
+            id = "budgeted"
+            name = "Budgeted"
+            description = "Cap the step output"
+
+            [[steps]]
+            id = "bounded"
+            server = "fixture"
+            tool = "echo"
+            arguments = { message = "x" }
+            max_output_tokens = 8
+        "#,
+    )
+    .expect("budget skill should be written");
+    let manager = fixture.manager();
+    manager
+        .connect_server("fixture", None)
+        .await
+        .expect("fixture should connect");
+
+    let result = manager
+        .run_skill("budgeted", json!({}))
+        .await
+        .expect("budgeted skill should run");
+    assert_eq!(result.status, SkillRunStatus::Ok);
+    let bounded = &result.results[0].result.value();
+    assert_eq!(bounded["truncated"], true);
+    assert!(
+        bounded["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max_output_tokens"))
+    );
+    manager.shutdown().await.expect("fixture should stop");
+}
+
+#[tokio::test]
 async fn running_skill_finishes_its_snapshot_during_catalog_reload() {
     let fixture = FixtureRuntime::new();
     fs::write(
